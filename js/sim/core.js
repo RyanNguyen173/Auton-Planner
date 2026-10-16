@@ -19,7 +19,7 @@ let uid=1;const nid=()=>'c'+(uid++)+Math.random().toString(36).slice(2,6);
 function defCfg(){return{
   robot:{w:24,l:24},
   drive:{wheel:3.25,cart:600,gIn:36,gOut:48,motors:8,mass:20,eff:80,track:19},
-  real:{kS:0.5,kVpct:100,kApct:100,ang:1.4,mu:0.9,trackPct:100,odoScale:0,gyroDrift:0},
+  real:{kS:0.5,kVpct:100,kApct:100,ang:1.4,mu:0.9,trackPct:100,odoScale:0,gyroDrift:0,rampMs:0},
   ff:null,
   traj:{v:50,a:100,d:100,lat:140},
   ram:{b:2,zeta:0.7},
@@ -29,7 +29,7 @@ function defCfg(){return{
   stop:'brake',
   ex:{hold:1.5,holdD:0.2,coast:30,glideA:60,glideW:360,steer:3,minV:4,minW:30}};}
 /* Fill in settings and command fields added in later versions so older saved projects still load */
-function normalizeProject(p){const d=defCfg();p.cfg.ex={...d.ex,...(p.cfg.ex||{})};if(!p.cfg.stop)p.cfg.stop=p.cfg.brake===false?'coast':'brake';delete p.cfg.brake;
+function normalizeProject(p){const d=defCfg();p.cfg.ex={...d.ex,...(p.cfg.ex||{})};p.cfg.real={...d.real,...(p.cfg.real||{})};if(!p.cfg.stop)p.cfg.stop=p.cfg.brake===false?'coast':'brake';delete p.cfg.brake;
   p.cmds.forEach(c=>{const def=CMDS[c.type]&&CMDS[c.type].def;if(def)for(const k in def)if(!(k in c))c[k]=JSON.parse(JSON.stringify(def[k]))});return p}
 
 /* Robot "truth": DC-motor style model per drive side. voltage = kS·sgn(v) + kV·v + kA·a */
@@ -39,7 +39,16 @@ function plantOf(C){
   const F=Math.max(1,d.motors)/2*stall*(d.gOut/d.gIn)/(D/2)*eff, mSide=Math.max(1,d.mass)*0.4536/2, aStall=F/mSide;
   const kV0=12/(vFree*eff), kA0=12/aStall;
   return{rpm,vFree,vMax:vFree*eff,aStall,kS:Math.max(0,r.kS),kV:kV0*r.kVpct/100,kA:kA0*r.kApct/100,kV0,kA0,ang:Math.max(0.2,r.ang),
-    aTrac:Math.max(0.05,r.mu)*G,coast:clamp((C.ex?C.ex.coast:30)/100,0,1),W:d.track*IN,Weff:d.track*IN*r.trackPct/100,odoScale:r.odoScale/100,gyro:-r.gyroDrift*D2R};
+    aTrac:Math.max(0.05,r.mu)*G,coast:clamp((C.ex?C.ex.coast:30)/100,0,1),W:d.track*IN,Weff:d.track*IN*r.trackPct/100,odoScale:r.odoScale/100,gyro:-r.gyroDrift*D2R,
+    uRate:r.rampMs>0?12/(r.rampMs/1000):Infinity};
+}
+/* Rate-limits commanded voltage toward the controller's request, modeling motor-controller current limiting
+   (and the mechanical inertia of reversing torque) so a command can't jump straight from full reverse to full
+   forward. Applied once per 10 ms control tick, ahead of the ±12 V clamp. */
+function slewVoltage(S,P,uL,uR,dt){
+  if(!isFinite(P.uRate))return{uL:clamp(uL,-12,12),uR:clamp(uR,-12,12)};
+  const step=P.uRate*dt;
+  return{uL:clamp(clamp(uL,-12,12),S.uL-step,S.uL+step),uR:clamp(clamp(uR,-12,12),S.uR-step,S.uR+step)};
 }
 function ffFromPlant(P){return{kS:+P.kS.toFixed(3),kV:+P.kV.toFixed(3),kA:+P.kA.toFixed(3),kP:2}}
 
@@ -205,7 +214,7 @@ function simulate(proj){
     const ctrl=MK[c.type](c,C,P,tr);ctrl.init(S);
     const t0=S.t,timeout=c.type==='wait'?1e9:c.type==='followPath'?(c.timeout>0?c.timeout/1000:tr.T+1.5):c.timeout/1000;
     let sat=0,ticks=0,reason=null;
-    for(;;){const o=ctrl.step(S,dt);S.uL=clamp(o.uL,-12,12);S.uR=clamp(o.uR,-12,12);S.coast=!!o.coast;if(Math.abs(S.uL)>11.9||Math.abs(S.uR)>11.9)sat++;ticks++;
+    for(;;){const o=ctrl.step(S,dt),u=o.coast?{uL:0,uR:0}:slewVoltage(S,P,o.uL,o.uR,dt);S.uL=u.uL;S.uR=u.uR;S.coast=!!o.coast;if(Math.abs(S.uL)>11.9||Math.abs(S.uR)>11.9)sat++;ticks++;
       if(o.done)reason=o.done;else if(S.t-t0>=timeout-1e-9)reason='Timeout';
       snap(ci,o);if(reason)break;
       for(let k=0;k<sub;k++)physStep(S,P,dt/sub);S.t=Math.round((S.t+dt)*1000)/1000;
@@ -214,7 +223,7 @@ function simulate(proj){
     if(reason==='Early exit'&&c.exitMode&&c.exitMode!=='chain'&&!stopped){
       tExit=S.t;exitPose={x:S.x/IN,y:S.y/IN,h:t2h(S.th)};const tg=ctrl.target?ctrl.target(S):null,hold={L:S.pL,R:S.pR},g=c.exitMode==='guide'&&tg?guideCtrl(tg,C):null,lim=S.t+Math.max(0,c.exitMs)/1000;
       for(;;){const o=g?g.step(S,dt):{...stopOut(c.exitMode,S,C,hold),ePos:NaN,eHead:NaN};o.ph='exit';
-        S.uL=clamp(o.uL,-12,12);S.uR=clamp(o.uR,-12,12);S.coast=!!o.coast;snap(ci,o);
+        const u=o.coast?{uL:0,uR:0}:slewVoltage(S,P,o.uL,o.uR,dt);S.uL=u.uL;S.uR=u.uR;S.coast=!!o.coast;snap(ci,o);
         if(S.t>=lim-1e-9||(g&&o.done)||(!g&&Math.abs(S.vL)+Math.abs(S.vR)<0.01&&S.t-tExit>0.05))break;
         for(let k=0;k<sub;k++)physStep(S,P,dt/sub);S.t=Math.round((S.t+dt)*1000)/1000;if(S.t>=LIMIT){stopped=true;break}}
       S.coast=false}
@@ -254,5 +263,5 @@ function exampleProject(){const cfg=defCfg();cfg.ff=ffFromPlant(plantOf(cfg));
   ]};
 }
 
-export{IN,D2R,G,HALF,LIMIT,clamp,sgn,wrapPi,wrap180,norm360,h2t,t2h,bearing,f1,f2,nid,defCfg,normalizeProject,plantOf,ffFromPlant,physStep,
+export{IN,D2R,G,HALF,LIMIT,clamp,sgn,wrapPi,wrap180,norm360,h2t,t2h,bearing,f1,f2,nid,defCfg,normalizeProject,plantOf,ffFromPlant,physStep,slewVoltage,
   segsOf,bz,bzd,bzdd,genTraj,sampleTraj,PID,Settle,mix,poseIn,MK,stopOut,guideCtrl,simulate,logAt,CMDS,exampleProject};

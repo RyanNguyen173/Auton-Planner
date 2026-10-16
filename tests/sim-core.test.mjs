@@ -2,7 +2,7 @@
    Run with `npm test` (node --test). */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { simulate, exampleProject, defCfg, plantOf, ffFromPlant, CMDS, normalizeProject, genTraj } from '../js/sim/core.js';
+import { simulate, exampleProject, defCfg, plantOf, ffFromPlant, CMDS, normalizeProject, genTraj, slewVoltage } from '../js/sim/core.js';
 
 const cmd = (type, o = {}) => ({ id: type + Math.random(), type, ...structuredClone(CMDS[type].def), ...o });
 const project = (start, cmds, tweak) => { const p = exampleProject(); p.start = start; p.cmds = cmds; if (tweak) tweak(p.cfg); p.cfg.ff = ffFromPlant(plantOf(p.cfg)); return p; };
@@ -94,6 +94,36 @@ test('older saved projects migrate', () => {
   normalizeProject(p);
   assert.equal(p.cfg.stop, 'coast'); assert.ok(p.cfg.ex.glideA > 0);
   for (const c of p.cmds) if (c.type !== 'wait') { assert.equal(c.exit, 0); assert.equal(c.exitMode, 'chain'); }
+  assert.ok(simulate(p).res.every(r => r.reason !== 'Timeout'));
+});
+
+test('voltage ramp bounds how fast commanded voltage can change', () => {
+  const S0 = { uL: -12, uR: -12 };
+  const P = plantOf(Object.assign(defCfg(), { real: { ...defCfg().real, rampMs: 200 } }));
+  assert.ok(isFinite(P.uRate) && Math.abs(P.uRate - 60) < 1e-9, `uRate ${P.uRate}`);
+  const u = slewVoltage(S0, P, 12, 12, 0.01);
+  assert.ok(Math.abs(u.uL - (-12)) <= 60 * 0.01 + 1e-9, `jumped to ${u.uL} in one 10 ms tick`);
+  assert.ok(u.uL > -12, 'did not move at all');
+  const off = plantOf(defCfg());
+  assert.equal(off.uRate, Infinity);
+  const instant = slewVoltage(S0, off, 12, 12, 0.01);
+  assert.equal(instant.uL, 12, 'rampMs=0 should behave exactly like before: no limiting');
+});
+
+test('voltage ramp smooths reversals and lowers peak saturation', () => {
+  const cmds = [cmd('moveToPoint', { x: 0, y: 24, timeout: 3000 }), cmd('moveToPoint', { x: 0, y: -24, timeout: 3000 })];
+  const sharp = simulate(project({ x: 0, y: 0, h: 0 }, cmds, c => { c.real.rampMs = 0; }));
+  const smooth = simulate(project({ x: 0, y: 0, h: 0 }, cmds, c => { c.real.rampMs = 250; }));
+  const maxStep = R => { let m = 0; for (let i = 1; i < R.log.length; i++) m = Math.max(m, Math.abs(R.log[i].uL - R.log[i - 1].uL), Math.abs(R.log[i].uR - R.log[i - 1].uR)); return m; };
+  assert.ok(maxStep(smooth) < maxStep(sharp), `ramped step ${maxStep(smooth)} vs instant ${maxStep(sharp)}`);
+  const satPeak = R => Math.max(0, ...R.res.filter(Boolean).map(r => r.sat));
+  assert.ok(satPeak(smooth) <= satPeak(sharp) + 1e-9, `ramped saturation ${satPeak(smooth)} vs instant ${satPeak(sharp)}`);
+});
+
+test('older saved projects without a ramp field still migrate (default to instant)', () => {
+  const p = exampleProject(); delete p.cfg.real.rampMs;
+  normalizeProject(p);
+  assert.equal(p.cfg.real.rampMs, 0);
   assert.ok(simulate(p).res.every(r => r.reason !== 'Timeout'));
 });
 
