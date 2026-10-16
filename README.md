@@ -1,53 +1,34 @@
 # Override Auton Planner
 
-A top-down autonomous route planner for **VEX U Override (2026–27)**. Plan both robots' paths, see how long each route takes, check them against the game rules, and export a picture of the route for the team.
+Plan and test autonomous routines for **VEX U Override (2026–27)**. One app, two views:
 
-It is a single static page (`index.html`) with no build step and no dependencies. It uses the Vesper design system: Public Sans and Geist Mono, paper and sky surfaces, hairline cards, and a black dark mode. The sun/moon button in the toolbar switches themes; the choice is remembered per browser.
+- **Route planner.** Draw both robots' routes with straight lines or Bezier curves, add actions (score, intake, flip toggle), and see a tank-drive timing estimate, the auton score, bonus and win-point checks, rule warnings and collisions. Export a route image with an action key, or the project JSON.
+- **Motion sim.** Chain Move to point, Move to pose (boomerang), Turn to heading, Turn to point, Follow Bezier path (RAMSETE or pure pursuit) and Wait. A modeled tank drive runs the routine, and the view charts wheel speed, voltage and error.
+  - Every motion supports **early exit**. After exiting, the robot can chain into the next command, coast, brake, or guide itself to the target.
+  - **Real-world effects** let the robot behave differently from what the controller assumes: wrong constants, odometry drift or gyro drift.
 
-## What it does
+In the planner's Path tab, **Simulate this route** sends the selected robot's route to the simulator. Lines become Move to point, smooth Bezier runs become one Follow path, heading locks become turns, and waiting actions become waits.
 
-- **Two-robot routes** drawn with straight lines or Bezier curves, plus opponent "ghost" robots to plan around.
-- **Tank-drive motion profiles.** Each side's speed is limited separately, so curves slow the robot down and point turns spin one side forward and one back. Top speed and acceleration come from wheel size, cartridge, gearing, motor count, mass and efficiency, or you can enter measured values.
-- **Actions at waypoints**: score pin, score cup, intake, flip toggle, or a custom step, each with a duration and either "waits" or "while moving".
-- **Scoring and rule checks** from Game Manual v2.1:
-  - pin-half visibility
-  - toggle ownership
-  - the yellow pin that starts in the Midfield goal
-  - the VEX U auton bonus (VUG5) and win point (VUG6)
-  - Autonomous Line crossings
-  - starting-position rules
-  - robot-to-robot and robot-to-field collisions
-- **Exports**: route image (PNG) with a numbered action key, and project JSON you can commit to this repo.
-- **Field image overlay**: paste or load a screenshot of the field to trace over.
-
-## Run it locally
-
-Open `index.html` in a browser, or serve the folder:
+## Run locally
 
 ```bash
-npx serve .
-# or
-python3 -m http.server 8000
+npm run dev      # http://localhost:5173
+npm test         # node:test suites, no install needed
 ```
+
+The app uses ES modules, so open it through a server, not by double-clicking `index.html`.
 
 ## Deploy on Vercel
 
-1. Push this folder to a GitHub repo.
-2. On vercel.com, choose **Add New → Project** and import the repo.
-3. Set **Framework Preset** to **Other**. Leave the build command and output directory empty.
-4. Deploy. Vercel serves `index.html` at the root URL.
+Import the repo, set the framework preset to **Other**, and leave the build command and output directory empty. Vercel serves `index.html` at the root. `/#sim` opens the simulator directly.
 
-Or use the CLI from this folder: `npx vercel` (preview) and `npx vercel --prod`.
+## Data
 
-## Data and storage
+- Your current planner project, saved route library, field image, simulator routine and theme are kept in each browser's local storage.
+- Use **Download .json** in either view's Saves tab to share a routine or commit it to the repo.
 
-- Saved routes and the field image are kept in each browser's local storage, so each teammate's library is their own.
-- Use **Saves → Download .json** to share a routine, or to keep it in git.
+## Working on it with Claude Code
 
-## Notes and assumptions
+`CLAUDE.md` describes the architecture, unit and heading conventions, the design system rules, and the game manual sources. Read it first.
 
-- Field coordinates come from the VEX GPS layout, in inches from field center. Heading 0° faces the top wall, and angles increase clockwise, the same as a V5 inertial sensor.
-- I estimated the tape spacing for the Autonomous Line and Midfield, and the Load Zone size, from the manual's field figures.
-- All four toggles start yellow.
-- Skills mode currently reuses the match scoring table.
-- Re-check the rules whenever a new Game Manual version is released.
+Competition robot code must be written by students (VEX rule G4). This repo is for planning and analysis only.

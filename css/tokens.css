@@ -1,0 +1,36 @@
+/* Vesper design tokens (Paper light theme, black dark theme).
+   Every color in the app comes from these. Canvas drawing reads them with getComputedStyle, so a theme change only needs a redraw. */
+:root{
+  /* Vesper tokens (Paper theme) */
+  --paper:#ffffff; --surface:#f5f9fe; --surface-sunken:#e8f1fb; --ink:#0e1726; --ink-muted:#4b586b; --ink-subtle:#5f6d83;
+  --line:#dde8f5; --line-strong:#c3d5ea; --control-line:#7d8ea6; --ring:#0e1726; --accent:#8cc4f5; --on-accent:#0e1726;
+  --accent-ink:#1a5fb0; --accent-wash:#e3f0fd; --inverse:#0b2447; --on-inverse:#ffffff; --success:#0e7a6b; --warning:#8f5f00; --danger:#b42318;
+  --shadow-hairline:0 0 0 1px rgba(11,36,71,0.10); --shadow-soft:0 4px 12px 2px rgba(11,36,71,0.04),0 24px 60px 4px rgba(11,36,71,0.08);
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px; --space-7:48px;
+  --radius-xs:4px; --radius-sm:6px; --radius-md:8px; --radius-lg:16px; --radius-xl:24px; --radius-pill:999px;
+  --font-sans:"Public Sans",ui-sans-serif,system-ui,sans-serif; --font-mono:"Geist Mono",ui-monospace,SFMono-Regular,monospace;
+  --ease-out:cubic-bezier(0.23,1,0.32,1); --dur-press:140ms; --dur-fast:160ms; --dur-base:220ms; --press-scale:0.97;
+  /* Planner data colors: alliances, field drawing and chart series (canvas reads these) */
+  --red:#d92d3a; --red2:#e8730c; --blue:#2563d6; --blue2:#0b93b0; --yellow:#e6b31e;
+  --field:#b4c4d8; --tileA:#bfcde0; --tileB:#b7c6da; --seam:#a3b5cb; --tape:#ffffff;
+  --sideL:#1a5fb0; --sideR:#d1590a;
+  /* aliases used by the drawing code */
+  --bg:var(--paper); --panel:var(--surface); --panel2:var(--surface-sunken); --muted:var(--ink-muted); --sel:var(--accent);
+  --good:var(--success); --warn:var(--warning); --bad:var(--danger);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --paper:#000000; --surface:#111111; --surface-sunken:#080808; --ink:#f2f2f2; --ink-muted:#a6a6a6; --ink-subtle:#8c8c8c;
+  --line:#222222; --line-strong:#333333; --control-line:#6e6e6e; --ring:#f2f2f2; --accent:#7fbcf5; --on-accent:#0e1726;
+  --accent-ink:#8ec5ff; --accent-wash:#1e1e1e; --inverse:#f2f2f2; --on-inverse:#000000; --success:#4dc7b5; --warning:#e0b04a; --danger:#f97066;
+  --shadow-hairline:0 0 0 1px rgba(255,255,255,0.12); --shadow-soft:0 24px 60px 4px rgba(0,0,0,0.6);
+  --red:#f0525d; --red2:#f5953f; --blue:#5b8ff0; --blue2:#2cc0db; --yellow:#f2c94c;
+  --field:#141414; --tileA:#1c1c1c; --tileB:#171717; --seam:#2c2c2c; --tape:#d9d9d9; --sideL:#8ec5ff; --sideR:#f5953f;
+  color-scheme:dark}}
+:root[data-theme="dark"]{
+  --paper:#000000; --surface:#111111; --surface-sunken:#080808; --ink:#f2f2f2; --ink-muted:#a6a6a6; --ink-subtle:#8c8c8c;
+  --line:#222222; --line-strong:#333333; --control-line:#6e6e6e; --ring:#f2f2f2; --accent:#7fbcf5; --on-accent:#0e1726;
+  --accent-ink:#8ec5ff; --accent-wash:#1e1e1e; --inverse:#f2f2f2; --on-inverse:#000000; --success:#4dc7b5; --warning:#e0b04a; --danger:#f97066;
+  --shadow-hairline:0 0 0 1px rgba(255,255,255,0.12); --shadow-soft:0 24px 60px 4px rgba(0,0,0,0.6);
+  --red:#f0525d; --red2:#f5953f; --blue:#5b8ff0; --blue2:#2cc0db; --yellow:#f2c94c;
+  --field:#141414; --tileA:#1c1c1c; --tileB:#171717; --seam:#2c2c2c; --tape:#d9d9d9; --sideL:#8ec5ff; --sideR:#f5953f;
+  color-scheme:dark}

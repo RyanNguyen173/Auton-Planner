@@ -1,0 +1,803 @@
+/* Route planner view: draw two-robot (plus opponent ghost) autonomous routes on the Override field,
+   estimate timing with a tank-drive motion profile, track scoring and rule checks, export images and JSON.
+   Everything here is scoped to the view's root element; shell services (modal, tips, theme) come from shared/ui.js. */
+import {showModal,closeModal,confirmDelete,isModalOpen,mq,registerTips,onThemeChange,downloadBlob} from '../shared/ui.js';
+import {HALF,MM,GOAL_R,TALL_R,MID_IN,LINE_HALF,LZ,MIDPOLY,sideOf,LOADZONES,GOALS,TOGGLES,LOADERS,OBJECTS,quadOf,QUAD_ALLY,goalQuad} from '../shared/field-data.js';
+
+/**
+ * @param {HTMLElement} root  the [data-pane="plan"] section
+ * @param {{isActive:()=>boolean, simulate:(payload:{robot:object,alliance:string,planned:number|null})=>void}} hooks
+ */
+export function initPlanner(root,hooks){
+  const PINS={ry:{name:'Red / Yellow',h:['red','yellow']},by:{name:'Blue / Yellow',h:['blue','yellow']},yy:{name:'Yellow / Yellow',h:['yellow','yellow']},rb:{name:'Red / Blue',h:['red','blue']}};
+  const KINDS={
+    scorePin:{name:'Score pin',color:'--good',shape:'circle'},
+    scoreCup:{name:'Score cup',color:'--good',shape:'square'},
+    intakePin:{name:'Intake pin',color:'--accent',shape:'circle'},
+    intakeCup:{name:'Intake cup',color:'--accent',shape:'square'},
+    toggle:{name:'Flip toggle',color:'--yellow',shape:'diamond'},
+    custom:{name:'Custom',color:'--muted',shape:'triangle'},
+  };
+
+  /* ---------------- State ---------------- */
+  let uid=1; const nid=()=>'a'+(uid++);
+  const defParams=big=>big
+    ?{wheel:3.25,cart:600,gIn:36,gOut:48,motors:8,mass:20,eff:80,track:19,vMode:'derived',vMan:55,aMode:'derived',aMan:120,turnPct:70,curv:true,aLat:180}
+    :{wheel:3.25,cart:600,gIn:36,gOut:48,motors:6,mass:12,eff:80,track:11.5,vMode:'derived',vMan:55,aMode:'derived',aMan:120,turnPct:70,curv:true,aLat:180};
+  const L=(x,y,o={})=>({type:'line',x,y,c1:null,c2:null,rev:false,lock:null,spd:100,...o});
+  const B=(x,y,c1,c2,o={})=>({type:'bezier',x,y,c1:{x:c1[0],y:c1[1]},c2:{x:c2[0],y:c2[1]},rev:false,lock:null,spd:100,...o});
+  const A=(wp,kind,o={})=>({id:nid(),wp,kind,dur:0.5,mode:'wait',goal:'C',toggle:'L',pin:'held',up:0,vis:'top',label:'',...o});
+
+  function demoRobots(){
+    return [
+      {id:'r1',name:'Robot 1',kind:'ours',slot:0,w:24,l:24,hidden:false,params:defParams(true),start:{x:-60,y:0,h:270},
+        segs:[
+          L(-50,0,{rev:true}),
+          L(-50,4),
+          L(-50,0,{rev:true}),
+          B(-24,-12,[-38,0],[-24,0],{lock:180}),
+          L(-24,-24),
+          L(-30,-24),
+          L(-16,-24,{rev:true}),
+        ],
+        actions:[A(0,'toggle',{toggle:'L',dur:0.8}),A(2,'scorePin',{goal:'NL',up:1,dur:0.7}),A(4,'intakePin',{pin:'yy',dur:0.4}),A(6,'scorePin',{goal:'RL',up:0,dur:0.7})]},
+      {id:'r2',name:'Robot 2',kind:'ours',slot:1,w:15,l:15,hidden:false,params:defParams(false),start:{x:-38,y:-64.5,h:0},
+        segs:[
+          L(-38,-47.2,{lock:90}),
+          L(-42,-47.2,{rev:true}),
+          B(-8,-61,[-42,-64],[-8,-56],{lock:180}),
+          L(-8,-48,{rev:true}),
+        ],
+        actions:[A(1,'scorePin',{goal:'RB',up:1,dur:0.7}),A(3,'toggle',{toggle:'B',dur:0.8})]},
+    ];
+  }
+  const state={acc:{drive:true,motion:true,start:false},mode:'match',autonLen:30,alliance:'red',opp:20,tool:'select',snap:3,units:'in',time:7,playing:false,rate:1,active:0,sel:0,tab:'path',robots:demoRobots()};
+  let RES=[], WARN=[], hover=null;
+  const OVKEY='override-auton-planner-overlay-v1';
+  const ov={img:null,src:null,op:0.75,trims:[0,0,0,0],rot:0,flip:false,on:true}; /* trims = % cut from the top, right, bottom, left as shown on the field */
+
+  /* ---------------- Math ---------------- */
+  const D2R=Math.PI/180;
+  const norm=h=>((h%360)+360)%360;
+  const hdg=(dx,dy)=>norm(Math.atan2(dx,dy)/D2R);
+  const angDiff=(a,b)=>((b-a+540)%360)-180;
+  const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const f1=n=>(Math.round(n*10)/10).toFixed(1), f2=n=>n.toFixed(2);
+  function bez(p0,c1,c2,p3,t){const u=1-t;return{x:u*u*u*p0.x+3*u*u*t*c1.x+3*u*t*t*c2.x+t*t*t*p3.x,y:u*u*u*p0.y+3*u*u*t*c1.y+3*u*t*t*c2.y+t*t*t*p3.y}}
+  function sampleSeg(p0,s){
+    const step=0.75, out=[];
+    if(s.type==='line'){const Ln=dist(p0,s),n=Math.max(2,Math.ceil(Ln/step));for(let i=0;i<=n;i++)out.push({x:p0.x+(s.x-p0.x)*i/n,y:p0.y+(s.y-p0.y)*i/n});return out}
+    const dense=[];let cum=[0];for(let i=0;i<=300;i++){dense.push(bez(p0,s.c1,s.c2,s,i/300));if(i)cum.push(cum[i-1]+dist(dense[i-1],dense[i]))}
+    const tot=cum[300],n=Math.max(2,Math.ceil(tot/step));let k=0;
+    for(let i=0;i<=n;i++){const d=tot*i/n;while(k<299&&cum[k+1]<d)k++;const span=cum[k+1]-cum[k]||1,u=(d-cum[k])/span;out.push({x:dense[k].x+(dense[k+1].x-dense[k].x)*u,y:dense[k].y+(dense[k+1].y-dense[k].y)*u})}
+    return out;
+  }
+  function startDir(p0,s){if(s.type==='bezier'){for(const q of [s.c1,s.c2,s]){if(dist(q,p0)>1e-3)return hdg(q.x-p0.x,q.y-p0.y)}}return hdg(s.x-p0.x,s.y-p0.y)}
+  function endDir(p0,s){if(s.type==='bezier'){for(const q of [s.c2,s.c1,p0]){if(dist(q,s)>1e-3)return hdg(s.x-q.x,s.y-q.y)}}return hdg(s.x-p0.x,s.y-p0.y)}
+  function trap(th,vm,a){
+    vm=Math.max(vm,1e-3);a=Math.max(a,1e-3);
+    let tA=vm/a,dA=.5*a*tA*tA;
+    if(2*dA>=th){tA=Math.sqrt(th/a);const dur=2*tA;return{dur,pos:t=>t<tA?.5*a*t*t:th-.5*a*(dur-t)**2,vel:t=>t<tA?a*t:a*(dur-t)}}
+    const cr=(th-2*dA)/vm,dur=2*tA+cr;
+    return{dur,pos:t=>t<tA?.5*a*t*t:t<tA+cr?dA+vm*(t-tA):th-.5*a*(dur-t)**2,vel:t=>t<tA?a*t:t<tA+cr?vm:a*(dur-t)};
+  }
+  function physics(p){
+    const wheelRpm=p.cart*p.gIn/p.gOut, vTheo=wheelRpm/60*Math.PI*p.wheel, vDer=vTheo*p.eff/100;
+    const stall={100:2.1,200:1.05,600:0.35}[p.cart]||0.35, tWheel=stall*p.cart/wheelRpm, r=p.wheel/2*0.0254;
+    const force=p.motors*tWheel/r*0.5, m=Math.max(p.mass,1)*0.4536;
+    const aMotor=force/m/0.0254, aTrac=0.7*9.81/0.0254, aDer=Math.min(aMotor,aTrac)*p.eff/100;
+    const v=p.vMode==='manual'?p.vMan:vDer, a=p.aMode==='manual'?p.aMan:aDer, half=Math.max(p.track,1)/2;
+    return{wheelRpm,vTheo,vDer,aDer,limit:aMotor<aTrac?'motor torque':'traction',v,a,wMax:v/half*p.turnPct/100,alpha:a/half*p.turnPct/100,aLat:p.aLat,curv:p.curv,half};
+  }
+
+  /* ---------------- Locks: a locked end heading aligns that Bezier's end handle (any mismatch with the next segment becomes a point turn) ---------------- */
+  function applyLocks(R){
+    const wps=[R.start,...R.segs];
+    R.segs.forEach(s=>{if(s.lock==null||s.type!=='bezier')return;const dir=norm(s.lock+(s.rev?180:0)),len=Math.max(2,dist(s.c2,s));s.c2={x:s.x-Math.sin(dir*D2R)*len,y:s.y-Math.cos(dir*D2R)*len}});
+  }
+
+  /* ---------------- Motion compute ---------------- */
+  function computeRobot(R){
+    const P=physics(R.params),S=[],blocks=[],events=[],segInfo=[];
+    let t=0,x=R.start.x,y=R.start.y,h=R.start.h;
+    const wps=[R.start,...R.segs.map(s=>({x:s.x,y:s.y}))];
+    const segPts=R.segs.map((s,i)=>sampleSeg(wps[i],s));
+    const st=i=>norm(startDir(wps[i],R.segs[i])+(R.segs[i].rev?180:0));
+    const en=i=>norm(endDir(wps[i],R.segs[i])+(R.segs[i].rev?180:0));
+    const actsAt=wi=>R.actions.filter(a=>a.wp===wi);
+    S.push({t,x,y,h,v:0,vL:0,vR:0,k:'start'});
+    const turnTo=target=>{
+      const d=angDiff(h,target);if(Math.abs(d)<0.5){h=norm(target);return}
+      const th=Math.abs(d)*D2R,pr=trap(th,P.wMax,P.alpha),t0=t,h0=h,n=24;
+      for(let k=1;k<=n;k++){const tau=pr.dur*k/n;const ws=Math.sign(d)*pr.vel(tau)*P.half;S.push({t:t0+tau,x,y,h:norm(h0+Math.sign(d)*pr.pos(tau)/D2R),v:0,vL:ws,vR:-ws,k:'turn'})}
+      t=t0+pr.dur;h=norm(target);blocks.push({t0,t1:t,k:'turn',label:`Turn ${d>0?'+':''}${Math.round(d)}°`});
+    };
+    const doActs=wi=>{for(const a of actsAt(wi)){const t0=t,t1=t+Math.max(0,a.dur);events.push({a,t0,t1,x,y,h,wi,R});
+      if(a.mode==='wait'){t=t1;S.push({t,x,y,h,v:0,vL:0,vR:0,k:'wait'});blocks.push({t0,t1,k:'act',a})}else blocks.push({t0,t1,k:'actm',a})}};
+    const cont=j=>{const s=R.segs[j],a=en(j),b=st(j+1);return Math.abs(angDiff(a,b))<4&&s.rev===R.segs[j+1].rev&&!actsAt(j+1).some(q=>q.mode==='wait')&&(s.lock==null||Math.abs(angDiff(s.lock,a))<4)};
+    const drive=(i,j)=>{
+      const pts=[],sidx=[],jIdx={};
+      for(let k=i;k<=j;k++){const sp=segPts[k];for(let m=pts.length?1:0;m<sp.length;m++){pts.push(sp[m]);sidx.push(k)}jIdx[k+1]=pts.length-1}
+      const n=pts.length;if(n<2)return;
+      const ds=[0],vl=[],v=[];for(let m=1;m<n;m++)ds.push(dist(pts[m-1],pts[m]));
+      /* Tank (differential) drive: signed path curvature k (1/in, + = turning left). Each side's wheel speed is
+         v(1 ∓ k·b/2), so the outer side hits the motor limit first: center speed ≤ vMax / (1 + |k|·b/2).
+         The same factor scales the accel each side can deliver. Optional extra cap from lateral grip: v ≤ √(aLat/|k|). */
+      const ks=[];for(let m=0;m<n;m++){let k=0;if(m>=2&&m<n-2){const a=pts[m-2],b=pts[m],c=pts[m+2],ab=dist(a,b),bc=dist(b,c),ca=dist(c,a),cr=(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);k=ab*bc*ca>1e-9?2*cr/(ab*bc*ca):0}ks.push(k)}
+      const sideF=m=>1+Math.abs(ks[m])*P.half;
+      for(let m=0;m<n;m++){let lim=P.v*R.segs[sidx[m]].spd/100/sideF(m);const k=Math.abs(ks[m]);
+        if(P.curv&&k>1e-4)lim=Math.min(lim,Math.sqrt(P.aLat/k));
+        vl.push(Math.max(lim,1))}
+      v[0]=0;for(let m=1;m<n;m++)v[m]=Math.min(vl[m],Math.sqrt(v[m-1]**2+2*P.a/sideF(m)*ds[m]));
+      v[n-1]=0;for(let m=n-2;m>=0;m--)v[m]=Math.min(v[m],Math.sqrt(v[m+1]**2+2*P.a/sideF(m)*ds[m+1]));
+      const tt=[t];for(let m=1;m<n;m++)tt.push(tt[m-1]+ds[m]/Math.max((v[m-1]+v[m])/2,0.3));
+      const rev=R.segs[i].rev;
+      for(let m=1;m<n;m++){const a=pts[Math.max(0,m-1)],b=pts[Math.min(n-1,m+1)];let hh=norm(hdg(b.x-a.x,b.y-a.y)+(rev?180:0));if(m===n-1)hh=en(j);const vlin=rev?-v[m]:v[m],om=v[m]*ks[m];S.push({t:tt[m],x:pts[m].x,y:pts[m].y,h:hh,v:v[m],vL:vlin-om*P.half,vR:vlin+om*P.half,k:'drive',seg:sidx[m],rev})}
+      for(let k=i;k<=j;k++){const a=k===i?0:jIdx[k],b=jIdx[k+1];let len=0;for(let m=a+1;m<=b;m++)len+=ds[m];segInfo[k]={len,t0:tt[a],t1:tt[b]};blocks.push({t0:tt[a],t1:tt[b],k:'drive',seg:k,rev:R.segs[k].rev})}
+      for(let k=i+1;k<=j;k++)for(const a of actsAt(k)){const t0=tt[jIdx[k]];events.push({a,t0,t1:t0+a.dur,x:pts[jIdx[k]].x,y:pts[jIdx[k]].y,h:en(k-1),wi:k,R});blocks.push({t0,t1:t0+a.dur,k:'actm',a})}
+      t=tt[n-1];x=pts[n-1].x;y=pts[n-1].y;h=en(j);
+    };
+    doActs(0);
+    let i=0;
+    while(i<R.segs.length){let j=i;while(j+1<R.segs.length&&cont(j))j++;turnTo(st(i));drive(i,j);const s=R.segs[j];if(s.lock!=null)turnTo(norm(s.lock));doActs(j+1);i=j+1}
+    events.sort((a,b)=>a.t0-b.t0);
+    const end=Math.max(t,...events.map(e=>e.t1),0);
+    return{S,blocks,events,segInfo,driveEnd:t,end,P,R};
+  }
+  function poseAt(res,t){
+    const S=res.S;if(t<=S[0].t)return S[0];if(t>=S[S.length-1].t)return S[S.length-1];
+    let lo=0,hi=S.length-1;while(hi-lo>1){const m=(lo+hi)>>1;if(S[m].t<=t)lo=m;else hi=m}
+    const a=S[lo],b=S[hi],u=(t-a.t)/((b.t-a.t)||1);
+    return{t,x:a.x+(b.x-a.x)*u,y:a.y+(b.y-a.y)*u,h:norm(a.h+angDiff(a.h,b.h)*u),v:a.v+(b.v-a.v)*u,vL:a.vL+(b.vL-a.vL)*u,vR:a.vR+(b.vR-a.vR)*u,k:b.k};
+  }
+
+  /* ---------------- Geometry tests ---------------- */
+  function corners(p,w,l){const s=Math.sin(p.h*D2R),c=Math.cos(p.h*D2R),f={x:s,y:c},r={x:c,y:-s};
+    return[[1,1],[1,-1],[-1,-1],[-1,1]].map(([a,b])=>({x:p.x+f.x*l/2*a+r.x*w/2*b,y:p.y+f.y*l/2*a+r.y*w/2*b}))}
+  function axesOf(cs){return[0,1].map(i=>{const a=cs[i],b=cs[i+1],d=Math.hypot(b.x-a.x,b.y-a.y)||1;return{x:(b.x-a.x)/d,y:(b.y-a.y)/d}})}
+  function polyHit(A,Bp){for(const ax of [...axesOf(A),...axesOf(Bp)]){let a1=1e9,a2=-1e9,b1=1e9,b2=-1e9;for(const p of A){const d=p.x*ax.x+p.y*ax.y;a1=Math.min(a1,d);a2=Math.max(a2,d)}for(const p of Bp){const d=p.x*ax.x+p.y*ax.y;b1=Math.min(b1,d);b2=Math.max(b2,d)}if(a2<b1||b2<a1)return false}return true}
+  function circHit(p,w,l,cx,cy,r){const s=Math.sin(p.h*D2R),c=Math.cos(p.h*D2R),dx=cx-p.x,dy=cy-p.y,lf=dx*s+dy*c,lr=dx*c-dy*s;const qx=clamp(lf,-l/2,l/2),qy=clamp(lr,-w/2,w/2);return Math.hypot(lf-qx,lr-qy)<r}
+  const rectPoly=(x,y,w,h)=>[{x:x-w/2,y:y-h/2},{x:x+w/2,y:y-h/2},{x:x+w/2,y:y+h/2},{x:x-w/2,y:y+h/2}];
+  const loaderPoly=ld=>rectPoly(ld.x,ld.y,6,7);
+  const inMid=(p,R)=>polyHit(corners(p,R.w,R.l),MIDPOLY);
+  const edgePts=cs=>{const out=[];for(let i=0;i<4;i++){const a=cs[i],b=cs[(i+1)%4];for(let k=0;k<6;k++)out.push({x:a.x+(b.x-a.x)*k/6,y:a.y+(b.y-a.y)*k/6})}return out};
+  const inPoly=(p,poly)=>{let ins=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const a=poly[i],b=poly[j];if((a.y>p.y)!==(b.y>p.y)&&p.x<(b.x-a.x)*(p.y-a.y)/(b.y-a.y)+a.x)ins=!ins}return ins};
+  /* A robot breaks the line in auton when part of it is past the far tape line on the opponent's side and outside the Midfield. */
+  const pastLine=(cs,ally)=>edgePts(cs).some(p=>(ally==='red'?sideOf(p.x,p.y)>LINE_HALF:sideOf(p.x,p.y)<-LINE_HALF)&&!inPoly(p,MIDPOLY));
+  const inLoadZone=cs=>LOADZONES.find(z=>polyHit(cs,rectPoly((z.x0+z.x1)/2,(z.y0+z.y1)/2,z.x1-z.x0,z.y1-z.y0)));
+
+  /* ---------------- Scoring ---------------- */
+  const ours=()=>state.robots.filter(r=>r.kind==='ours'&&!r.hidden);
+  const ghosts=()=>state.mode==='match'?state.robots.filter(r=>r.kind==='ghost'&&!r.hidden):[];
+  const oppA=()=>state.alliance==='red'?'blue':'red';
+  const resOf=R=>RES.find(r=>r.R===R);
+  function scoreAt(time){
+    const goals={};GOALS.forEach(gl=>goals[gl.id]=[]);
+    if(state.mode==='match')goals.C.push({k:'pin',pin:'yy',up:0,vis:'top',by:'field'}); /* VEX U setup: the Midfield Goal starts with one yellow/yellow Pin Placed */
+    const toggles={T:'yellow',R:'yellow',B:'yellow',L:'yellow'},hold={},notes=[];
+    const pre=state.alliance==='red'?'ry':'by';
+    ours().forEach(R=>hold[R.id]={pin:pre,cup:false});
+    const evs=RES.filter(r=>r.R.kind==='ours'&&!r.R.hidden).flatMap(r=>r.events).filter(e=>e.t1<=time+1e-9).sort((a,b)=>a.t1-b.t1);
+    for(const e of evs){const a=e.a,hd=hold[e.R.id];
+      if(a.kind==='intakePin'){if(hd.pin)notes.push({t:e.t1,R:e.R,msg:'Holding two pins (possession limit is one)'});hd.pin=a.pin==='held'?'yy':a.pin}
+      else if(a.kind==='intakeCup'){if(hd.cup)notes.push({t:e.t1,R:e.R,msg:'Holding two cups (possession limit is one)'});hd.cup=true}
+      else if(a.kind==='scorePin'){const pin=a.pin==='held'?hd.pin:a.pin;if(!pin){notes.push({t:e.t1,R:e.R,msg:`Score pin at ${e.wi} with no pin held`});continue}
+        goals[a.goal].push({k:'pin',pin,up:a.up??0,vis:a.vis||'top',halves:a.halves,by:e.R.id});if(a.pin==='held')hd.pin=null;
+        const gl=GOALS.find(q=>q.id===a.goal);if(gl.type===oppA())notes.push({t:e.t1,R:e.R,msg:`Scored on ${gl.name} (opponent goals are protected)`})}
+      else if(a.kind==='scoreCup'){if(!hd.cup){notes.push({t:e.t1,R:e.R,msg:'Score cup with no cup held'});continue}goals[a.goal].push({k:'cup',by:e.R.id});hd.cup=false}
+      else if(a.kind==='toggle')toggles[a.toggle]=state.alliance;
+    }
+    let midO=0,midG=0;
+    ours().forEach(R=>{const r=resOf(R);if(r&&inMid(poseAt(r,time),R))midO++});
+    ghosts().forEach(R=>{const r=resOf(R);if(r&&inMid(poseAt(r,time),R))midG++});
+    const midOwner=midO>midG?state.alliance:midG>midO?oppA():null;
+    const pts={red:0,blue:0},brk=[];
+    for(const gl of GOALS){const q=goalQuad(gl),owner=q==='M'?midOwner:(toggles[q]==='yellow'?null:toggles[q]);
+      for(const it of goals[gl.id]){if(it.k!=='pin')continue;const hs=PINS[it.pin].h;
+        /* <SC3>: a Pin Half nested inside a Goal or the opaque half of a Cup is not visible, so a Pin set straight into a Goal scores only its upper half. */
+        let up=it.up??0,v=it.vis||'top';if(it.halves==='both')v='both';else if(it.halves==='yellow'){up=Math.max(0,hs.indexOf('yellow'));}
+        const vis=v==='both'?hs:v==='none'?[]:[hs[up]];
+        let gain=0;for(const c of vis){if(c==='yellow'){if(owner){pts[owner]+=10;if(owner===state.alliance)gain+=10}}else{pts[c]+=5;if(c===state.alliance)gain+=5}}
+        brk.push({goal:gl,pin:it.pin,gain,owner,field:it.by==='field',vis,halvesOurs:vis.filter(c=>c===state.alliance||(c==='yellow'&&owner===state.alliance)).length})}}
+    const ourSide=gl=>gl.id==='C'||QUAD_ALLY[goalQuad(gl)]===state.alliance;
+    const awpHalves=brk.filter(b=>ourSide(b.goal)).reduce((n,b)=>n+b.halvesOurs,0);
+    const perGoal={};brk.filter(b=>ourSide(b.goal)).forEach(b=>perGoal[b.goal.id]=(perGoal[b.goal.id]||0)+b.halvesOurs);
+    const awpGoals=Object.values(perGoal).filter(n=>n>=2).length;
+    const onWall=ours().some(R=>{const r=resOf(R);return r&&corners(poseAt(r,time),R.w,R.l).some(c=>Math.abs(c.x)>HALF-0.5||Math.abs(c.y)>HALF-0.5)});
+    const awp=[{ok:awpHalves>=12,txt:`${awpHalves} / 12 Pin Halves scored on your side`},{ok:awpGoals>=4,txt:`${awpGoals} / 4 Goals with 2+ of your Pin Halves`},{ok:!onWall,txt:onWall?'A robot is touching the Field Perimeter':'Neither robot touching the Field Perimeter'},{ok:midO>=1,txt:midO>=1?'A robot is in the Midfield':'No robot in the Midfield'}];
+    return{goals,toggles,hold,notes,pts,midO,midG,midOwner,brk,ourPts:pts[state.alliance],midPts:midO*8,awp};
+  }
+
+  /* ---------------- Warnings ---------------- */
+  function computeWarnings(){
+    const out=[],open=new Map(),dt=0.05;
+    const list=[...ours(),...ghosts()].map(R=>({R,res:resOf(R)})).filter(o=>o.res);
+    const T=Math.max(state.autonLen,...list.map(o=>o.res.end));
+    const flag=(key,sev,msg,t,extra)=>{let iv=open.get(key);if(iv&&t-iv.t1<=dt*1.5){iv.t1=t;return}iv={key,sev,msg,t0:t,t1:t,...extra};out.push(iv);open.set(key,iv)};
+    const tgt=o=>o.res.events.filter(e=>e.a.kind==='scorePin'||e.a.kind==='scoreCup').map(e=>({g:e.a.goal,t0:e.t0-1.5,t1:e.t1+0.5}));
+    list.forEach(o=>o.tg=tgt(o));
+    for(let t=0;t<=T+1e-9;t+=dt){
+      const P=list.map(o=>{const p=poseAt(o.res,t);return{o,p,c:corners(p,o.R.w,o.R.l)}});
+      for(let i=0;i<P.length;i++)for(let j=i+1;j<P.length;j++){const a=P[i],b=P[j];if(a.o.R.kind==='ghost'&&b.o.R.kind==='ghost')continue;
+        if(polyHit(a.c,b.c))flag('rr'+a.o.R.id+b.o.R.id,'bad',`${a.o.R.name} overlaps ${b.o.R.name}`,t,{poses:[{R:a.o.R,p:a.p},{R:b.o.R,p:b.p}]})}
+      for(const q of P){const R=q.o.R;
+        for(const gl of GOALS){if(q.o.tg.some(w=>w.g===gl.id&&t>=w.t0&&t<=w.t1))continue;if(circHit(q.p,R.w,R.l,gl.x,gl.y,gl.tall?TALL_R:GOAL_R))flag('g'+R.id+gl.id,'warn',`${R.name} clips ${gl.name}`,t,{poses:[{R,p:q.p}]})}
+        LOADERS.forEach((ld,k)=>{if(polyHit(q.c,loaderPoly(ld)))flag('l'+R.id+k,'warn',`${R.name} clips a ${ld.a} loader`,t,{poses:[{R,p:q.p}]})});
+        if(q.c.some(c=>Math.abs(c.x)>HALF+0.3||Math.abs(c.y)>HALF+0.3))flag('f'+R.id,'bad',`${R.name} goes through the field perimeter`,t,{poses:[{R,p:q.p}]});
+        if(state.mode==='match'&&R.kind==='ours'&&t<=state.autonLen&&pastLine(q.c,state.alliance))flag('a'+R.id,'bad',`${R.name} crosses the Autonomous Line outside the Midfield`,t,{poses:[{R,p:q.p}]});
+      }
+    }
+    /* Starting-position rules (<SG1>, <VUR1>, <VURS3>) */
+    const mine=list.filter(o=>o.R.kind==='ours'),sAlly=state.mode==='skills'?'red':state.alliance;
+    mine.forEach(o=>{const R=o.R,p=o.res.S[0],cs=corners(p,R.w,R.l),poses=[{R,p}],add=(k,msg)=>out.push({key:'s'+k+R.id,sev:'bad',msg:`${R.name} start: ${msg}`,t0:0,t1:0,poses});
+      if(!cs.some(c=>Math.abs(c.x)>HALF-0.6||Math.abs(c.y)>HALF-0.6))add('w','not touching the Field Perimeter');
+      if(edgePts(cs).some(q=>sAlly==='red'?sideOf(q.x,q.y)>-LINE_HALF:sideOf(q.x,q.y)<LINE_HALF))add('s','not fully on your side of the Autonomous Line');
+      const z=inLoadZone(cs);if(z)add('z',`inside a ${z.a} Load Zone`);
+      GOALS.forEach(gl=>{if(circHit(p,R.w,R.l,gl.x,gl.y,gl.tall?TALL_R:GOAL_R))add('g'+gl.id,`touching ${gl.name}`)});});
+    if(mine.length===2){const [a,b]=mine;if(quadOf(a.res.S[0].x,a.res.S[0].y)===quadOf(b.res.S[0].x,b.res.S[0].y))out.push({key:'sq',sev:'bad',msg:'Both robots start in the same Quadrant',t0:0,t1:0});
+      const big=[a.R,b.R].map(R=>Math.max(R.w,R.l));if(Math.max(...big)>24||Math.min(...big)>15)out.push({key:'ss',sev:'bad',msg:'VEX U start sizes: one robot must fit 24 × 24 in and the other 15 × 15 in',t0:0,t1:0})}
+    list.forEach(o=>{if(o.R.kind==='ours'&&o.res.end>state.autonLen+1e-6)out.push({key:'ot'+o.R.id,sev:'bad',msg:`${o.R.name} runs ${f1(o.res.end-state.autonLen)} s past the period`,t0:state.autonLen,t1:o.res.end})});
+    scoreAt(1e9).notes.forEach((n,k)=>out.push({key:'n'+k,sev:'warn',msg:`${n.R.name}: ${n.msg}`,t0:n.t,t1:n.t}));
+    return out.sort((a,b)=>a.t0-b.t0);
+  }
+
+  /* ---------------- Pipeline ---------------- */
+  const PROJKEY='override-planner-project-v1';let saveT=0;
+  function recompute(){state.robots.forEach(applyLocks);RES=state.robots.map(computeRobot);WARN=computeWarnings();drawAll();renderBudget();clearTimeout(saveT);saveT=setTimeout(()=>{try{localStorage.setItem(PROJKEY,JSON.stringify(projectJSON()))}catch(_){}},400)}
+  const active=()=>state.robots[state.active]||state.robots[0];
+  const maxT=()=>Math.max(state.autonLen,...RES.filter(r=>!r.R.hidden).map(r=>r.end));
+
+  /* ---------------- Colors ---------------- */
+  let CV={};const readVars=()=>{const cs=getComputedStyle(document.documentElement);CV={};['--sideL','--sideR','--accent-ink','--line-strong','--bg','--panel','--panel2','--ink','--muted','--line','--accent','--sel','--field','--tileA','--tileB','--seam','--tape','--good','--warn','--bad','--red','--red2','--blue','--blue2','--yellow'].forEach(k=>CV[k]=cs.getPropertyValue(k).trim())};
+  const rcol=R=>{const a=R.kind==='ghost'?oppA():state.alliance;return CV['--'+a+(R.kind!=='ghost'&&R.slot===1?'2':'')]};
+  const allyCol=a=>a==='red'?CV['--red']:a==='blue'?CV['--blue']:CV['--yellow'];
+  const RAMP=[[91,63,209],[25,179,166],[255,210,63]];
+  const speedCol=u=>{u=clamp(u,0,1);const s=u<.5?0:1,k=u<.5?u*2:(u-.5)*2,a=RAMP[s],b=RAMP[s+1];return`rgb(${a.map((v,i)=>Math.round(v+(b[i]-v)*k)).join(',')})`};
+  const textOn=c=>{const m=c.match(/^#([0-9a-f]{6})$/i);if(!m)return '#0e1726';const n=parseInt(m[1],16),l=v=>{v/=255;return v<=0.03928?v/12.92:((v+0.055)/1.055)**2.4},L=0.2126*l(n>>16)+0.7152*l((n>>8)&255)+0.0722*l(n&255);return L>0.36?'#0e1726':'#ffffff'};
+  const alpha=(c,a)=>{if(c.startsWith('#')){const n=c.length===4?c.slice(1).split('').map(x=>x+x).join(''):c.slice(1);return`rgba(${parseInt(n.slice(0,2),16)},${parseInt(n.slice(2,4),16)},${parseInt(n.slice(4,6),16)},${a})`}return c};
+
+  /* ---------------- Canvas helpers ---------------- */
+  let T={ox:0,oy:0,s:1};
+  const px=x=>T.ox+(x+HALF)*T.s, py=y=>T.oy+(HALF-y)*T.s;
+  const wx=X=>(X-T.ox)/T.s-HALF, wy=Y=>HALF-(Y-T.oy)/T.s;
+  function fit(cv){const r=cv.getBoundingClientRect(),d=window.devicePixelRatio||1,w=Math.max(1,Math.round(r.width*d)),h=Math.max(1,Math.round(r.height*d));if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}const c=cv.getContext('2d');c.setTransform(d,0,0,d,0,0);return{c,w:r.width,h:r.height}}
+  function icon(c,kind,x,y,r,num,fg){const k=KINDS[kind];if(num!=null)fg=textOn(CV[k.color]);c.save();c.fillStyle=CV[k.color];c.strokeStyle=CV['--bg'];c.lineWidth=Math.max(1.5,r*0.18);c.beginPath();
+    if(k.shape==='circle')c.arc(x,y,r,0,7);else if(k.shape==='square')c.rect(x-r*.88,y-r*.88,r*1.76,r*1.76);else if(k.shape==='diamond'){c.moveTo(x,y-r*1.15);c.lineTo(x+r*1.15,y);c.lineTo(x,y+r*1.15);c.lineTo(x-r*1.15,y);c.closePath()}else{c.moveTo(x,y-r*1.1);c.lineTo(x+r*1.05,y+r*.8);c.lineTo(x-r*1.05,y+r*.8);c.closePath()}
+    c.fill();c.stroke();if(num!=null){c.fillStyle=fg||'#111';c.font=`600 ${Math.round(r*1.15)}px ${'Geist Mono, ui-monospace, monospace'}`;c.textAlign='center';c.textBaseline='middle';c.fillText(String(num),x,y+(k.shape==='triangle'?r*.15:0)+.5)}c.restore()}
+  function drawRobot(c,R,p,opts={}){const s=T.s,col=rcol(R);c.save();c.translate(px(p.x),py(p.y));c.rotate(p.h*D2R);
+    const w=R.w*s,l=R.l*s;c.globalAlpha=opts.alpha??1;c.fillStyle=alpha(col,R.kind==='ghost'?0.18:0.82);c.strokeStyle=R.kind==='ghost'?col:CV['--ink'];c.lineWidth=opts.lw||1.5;
+    if(R.kind==='ghost')c.setLineDash([5,4]);c.beginPath();c.roundRect?c.roundRect(-w/2,-l/2,w,l,Math.min(4,w*.1)):c.rect(-w/2,-l/2,w,l);c.fill();c.stroke();c.setLineDash([]);
+    c.fillStyle=R.kind==='ghost'?col:CV['--bg'];c.beginPath();c.moveTo(0,-l/2+3);c.lineTo(Math.min(9,w*.22),-l/2+Math.min(14,l*.3));c.lineTo(-Math.min(9,w*.22),-l/2+Math.min(14,l*.3));c.closePath();c.fill();
+    if(opts.hold){let k=0;if(opts.hold.pin){const hs=PINS[opts.hold.pin].h;c.fillStyle=allyCol(hs[0]);c.beginPath();c.arc(-4,4,4,Math.PI/2,Math.PI*1.5);c.fill();c.fillStyle=allyCol(hs[1]);c.beginPath();c.arc(-4,4,4,-Math.PI/2,Math.PI/2);c.fill();k++}
+      if(opts.hold.cup){c.strokeStyle=CV['--bg'];c.lineWidth=2;c.beginPath();c.arc(k?7:0,4,4.5,0,7);c.stroke()}}
+    c.restore();
+    if(opts.label){c.save();c.font=`600 11px ${'Public Sans, system-ui, sans-serif'}`;c.fillStyle=CV['--ink'];c.textAlign='center';const lbl=R.kind==='ghost'?R.name:R.name.replace('Robot ','R');const yy=py(p.y)-Math.max(R.w,R.l)*s*0.72-4;c.fillStyle=alpha(CV['--panel'],0.85);const tw=c.measureText(lbl).width+8;c.fillRect(px(p.x)-tw/2,yy-9,tw,14);c.fillStyle=CV['--ink'];c.fillText(lbl,px(p.x),yy+2);c.restore()}}
+
+  function drawField(c,sc,opts={}){
+    const s=T.s,x0=px(-HALF),y0=py(HALF),W=144*s;
+    c.fillStyle=CV['--field'];c.fillRect(x0,y0,W,W);
+    for(let i=0;i<6;i++)for(let j=0;j<6;j++){c.fillStyle=(i+j)%2?CV['--tileA']:CV['--tileB'];c.fillRect(x0+i*24*s,y0+j*24*s,24*s,24*s)}
+    c.strokeStyle=CV['--seam'];c.lineWidth=1;for(let i=1;i<6;i++){c.beginPath();c.moveTo(x0+i*24*s,y0);c.lineTo(x0+i*24*s,y0+W);c.moveTo(x0,y0+i*24*s);c.lineTo(x0+W,y0+i*24*s);c.stroke()}
+    if(ov.img&&ov.on){const im=ov.img,iw=im.naturalWidth,ih=im.naturalHeight,src=[0,0,0,0];
+      for(let d=0;d<4;d++)for(let e=0;e<4;e++){const f=ov.flip?[0,3,2,1][e]:e;if((f+ov.rot)%4===d)src[e]=ov.trims[d]/100}
+      const sx=iw*src[3],sy=ih*src[0],sw=Math.max(1,iw*(1-src[1]-src[3])),sh=Math.max(1,ih*(1-src[0]-src[2]));
+      c.save();c.beginPath();c.rect(x0,y0,W,W);c.clip();c.globalAlpha=ov.op;c.translate(x0+W/2,y0+W/2);c.rotate(ov.rot*Math.PI/2);if(ov.flip)c.scale(-1,1);
+      c.drawImage(im,sx,sy,sw,sh,-W/2,-W/2,W,W);c.restore()}
+    /* Quadrant tint, Load Zone tape, Autonomous Line (double tape on the top-left/bottom-right diagonal), Midfield diamond */
+    [['L',[[-HALF,HALF],[-12,12],[-24,0],[-12,-12],[-HALF,-HALF]]],['B',[[-HALF,-HALF],[-12,-12],[0,-24],[12,-12],[HALF,-HALF]]],['R',[[HALF,-HALF],[12,-12],[24,0],[12,12],[HALF,HALF]]],['T',[[HALF,HALF],[12,12],[0,24],[-12,12],[-HALF,HALF]]]].forEach(([q,pts])=>{c.fillStyle=alpha(allyCol(QUAD_ALLY[q]),0.07);c.beginPath();pts.forEach(([x,y],i)=>i?c.lineTo(px(x),py(y)):c.moveTo(px(x),py(y)));c.closePath();c.fill()});
+    c.save();c.lineWidth=Math.max(1.5,s*0.6);LOADZONES.forEach(z=>{c.strokeStyle=allyCol(z.a);c.beginPath();const ix=z.x0===-HALF?z.x1:z.x0,iy=z.y0===-HALF?z.y1:z.y0;c.moveTo(px(ix),py(z.y0===-HALF?-HALF:HALF));c.lineTo(px(ix),py(iy));c.lineTo(px(z.x0===-HALF?-HALF:HALF),py(iy));c.stroke()});c.restore();
+    c.save();c.strokeStyle=CV['--tape'];c.lineWidth=Math.max(1.5,s*0.6);c.lineCap='butt';
+    const seg=(a,b)=>{c.beginPath();c.moveTo(px(a[0]),py(a[1]));c.lineTo(px(b[0]),py(b[1]));c.stroke()};
+    seg([-HALF,-HALF],[-12,-12]);seg([HALF,HALF],[12,12]);
+    const o=LINE_HALF/Math.SQRT2;[[-o,-o],[o,o]].forEach(([dx,dy])=>{seg([-HALF+dx+0.8,HALF+dy-0.8],[-12+dx,12+dy]);seg([12+dx,-12+dy],[HALF+dx-0.8,-HALF+dy+0.8])});
+    c.beginPath();[[24,0],[0,24],[-24,0],[0,-24]].forEach(([x,y],i)=>i?c.lineTo(px(x),py(y)):c.moveTo(px(x),py(y)));c.closePath();c.stroke();c.restore();
+    c.lineWidth=3;c.strokeStyle=CV['--ink'];c.strokeRect(x0,y0,W,W);
+    c.fillStyle=CV['--red'];c.fillRect(x0-7,y0,4,W);c.fillStyle=CV['--blue'];c.fillRect(x0+W+3,y0,4,W);
+    LOADERS.forEach(ld=>{c.fillStyle=alpha(allyCol(ld.a),0.85);c.fillRect(px(ld.x-3),py(ld.y+3.5),6*s,7*s);c.strokeStyle=CV['--ink'];c.lineWidth=1;c.strokeRect(px(ld.x-3),py(ld.y+3.5),6*s,7*s)});
+    TOGGLES.forEach(tg=>{const col=allyCol(sc.toggles[tg.id]);c.fillStyle=col;c.strokeStyle=CV['--ink'];c.lineWidth=1;const lw=25.8,th=2.05;if(tg.horiz){c.fillRect(px(tg.x-lw/2),py(tg.y+th/2),lw*s,th*s);c.strokeRect(px(tg.x-lw/2),py(tg.y+th/2),lw*s,th*s)}else{c.fillRect(px(tg.x-th/2),py(tg.y+lw/2),th*s,lw*s);c.strokeRect(px(tg.x-th/2),py(tg.y+lw/2),th*s,lw*s)}});
+    OBJECTS.forEach(o=>{c.fillStyle=alpha(CV['--yellow'],0.55);c.strokeStyle=alpha(CV['--ink'],0.5);c.lineWidth=1;c.beginPath();c.arc(px(o.x),py(o.y),Math.max(2,1.4*s),0,7);c.fill();c.stroke()});
+    GOALS.forEach(gl=>{const r=(gl.tall?TALL_R:GOAL_R)*s;c.fillStyle=gl.type==='neutral'?CV['--panel2']:alpha(allyCol(gl.type),0.9);c.strokeStyle=CV['--ink'];c.lineWidth=gl.tall?2.5:1.5;c.beginPath();c.arc(px(gl.x),py(gl.y),r,0,7);c.fill();c.stroke();
+      const st=sc.goals[gl.id];if(st&&st.length){const pins=st.filter(i=>i.k==='pin'),cups=st.length-pins.length;let k=0;pins.forEach(pn=>{const hs=PINS[pn.pin].h,a=-Math.PI/2+k*0.75,rr=r+5,cx=px(gl.x)+Math.cos(a)*rr,cy=py(gl.y)+Math.sin(a)*rr;c.fillStyle=allyCol(hs[0]);c.beginPath();c.arc(cx,cy,3.6,Math.PI/2,Math.PI*1.5);c.fill();c.fillStyle=allyCol(hs[1]);c.beginPath();c.arc(cx,cy,3.6,-Math.PI/2,Math.PI/2);c.fill();c.strokeStyle=CV['--ink'];c.lineWidth=1;c.beginPath();c.arc(cx,cy,3.6,0,7);c.stroke();k++});
+        if(cups){c.fillStyle=CV['--ink'];c.font='600 10px Geist Mono, monospace';c.textAlign='center';c.fillText(`+${cups}c`,px(gl.x),py(gl.y)+r+11)}}});
+    if(!opts.export){c.save();c.font='600 10px Public Sans, system-ui, sans-serif';c.fillStyle=CV['--muted'];c.translate(x0-11,y0+W/2);c.rotate(-Math.PI/2);c.textAlign='center';c.fillText('RED ALLIANCE STATION',0,0);c.restore();
+      c.save();c.font='600 10px Public Sans, system-ui, sans-serif';c.fillStyle=CV['--muted'];c.translate(x0+W+15,y0+W/2);c.rotate(Math.PI/2);c.textAlign='center';c.fillText('BLUE ALLIANCE STATION',0,0);c.restore()}
+  }
+  function drawPaths(c,opts={}){
+    const s=T.s;
+    RES.forEach((res,ri)=>{const R=res.R;if(R.hidden||(R.kind==='ghost'&&state.mode!=='match'))return;const isA=ri===state.active&&!opts.export,col=rcol(R);
+      const dr=res.S.filter(q=>q.k==='drive'||q.k==='start');
+      c.save();c.lineCap='round';c.lineJoin='round';
+      let prev=res.S[0];
+      for(let i=1;i<res.S.length;i++){const q=res.S[i];if(q.k!=='drive'){prev=q;continue}
+        c.strokeStyle=isA?speedCol(((prev.v+q.v)/2)/Math.max(res.P.v,1)):alpha(col,opts.export?0.95:0.6);c.lineWidth=isA?4:(opts.export?4:2.5);c.setLineDash(q.rev?[7,5]:[]);c.beginPath();c.moveTo(px(prev.x),py(prev.y));c.lineTo(px(q.x),py(q.y));c.stroke();prev=q}
+      c.setLineDash([]);
+      if(isA){R.segs.forEach((sg,i)=>{if(sg.type!=='bezier')return;const p0=i?R.segs[i-1]:R.start;c.strokeStyle=alpha(CV['--ink'],0.55);c.lineWidth=1;c.beginPath();c.moveTo(px(p0.x),py(p0.y));c.lineTo(px(sg.c1.x),py(sg.c1.y));c.moveTo(px(sg.x),py(sg.y));c.lineTo(px(sg.c2.x),py(sg.c2.y));c.stroke();
+        [sg.c1,sg.c2].forEach(h=>{c.fillStyle=CV['--panel'];c.strokeStyle=CV['--ink'];c.lineWidth=1.5;c.fillRect(px(h.x)-4,py(h.y)-4,8,8);c.strokeRect(px(h.x)-4,py(h.y)-4,8,8)})})}
+      const wps=[R.start,...R.segs];
+      wps.forEach((w,i)=>{const sel=isA&&state.sel===i;const r=sel?8:(isA?6.5:4.5);c.fillStyle=sel?CV['--sel']:(isA?CV['--panel']:alpha(col,0.85));c.strokeStyle=isA?CV['--ink']:CV['--bg'];c.lineWidth=isA?2:1.2;c.beginPath();c.arc(px(w.x),py(w.y),r,0,7);c.fill();c.stroke();
+        if(isA&&!opts.export){c.fillStyle=CV['--ink'];c.font='600 9px Geist Mono, monospace';c.textAlign='center';c.textBaseline='middle';c.fillText(String(i),px(w.x),py(w.y)+.5)}
+        if(i>0&&w.lock!=null&&isA){const d=w.lock*D2R;c.strokeStyle=CV['--ink'];c.lineWidth=2;c.beginPath();c.moveTo(px(w.x),py(w.y));c.lineTo(px(w.x)+Math.sin(d)*16,py(w.y)-Math.cos(d)*16);c.stroke()}});
+      if(isA){const p=R.start,d=p.h*D2R,kx=px(p.x)+Math.sin(d)*(R.l/2*s+10),ky=py(p.y)-Math.cos(d)*(R.l/2*s+10);c.strokeStyle=CV['--ink'];c.lineWidth=1;c.setLineDash([2,3]);c.beginPath();c.moveTo(px(p.x),py(p.y));c.lineTo(kx,ky);c.stroke();c.setLineDash([]);c.fillStyle=CV['--sel'];c.beginPath();c.arc(kx,ky,5,0,7);c.fill();c.stroke()}
+      c.restore();
+      if(R.kind==='ours'){const seen={};res.events.forEach((e,k)=>{const key=e.wi;seen[key]=(seen[key]||0)+1;const off=(seen[key]-1);const a=-0.9+off*0.75,rr=(opts.export?20:16);const ix=px(e.x)+Math.cos(a)*rr,iy=py(e.y)+Math.sin(a)*rr;icon(c,e.a.kind,ix,iy,opts.export?9:7,k+1,'#121212')})}
+    });
+  }
+  function drawAll(){
+    if(root.hidden)return;
+    readVars();
+    {const {c,w,h}=fit(fieldCv);const pad=20,S=(Math.min(w,h)-pad*2)/144;T={ox:(w-144*S)/2,oy:(h-144*S)/2,s:S};c.clearRect(0,0,w,h);
+      const sc=scoreAt(state.time);drawField(c,sc);
+      if(hover){c.save();c.strokeStyle=CV['--bad'];c.lineWidth=2;c.setLineDash([4,3]);(hover.poses||[]).forEach(q=>{const cs=corners(q.p,q.R.w,q.R.l);c.beginPath();cs.forEach((p,i)=>i?c.lineTo(px(p.x),py(p.y)):c.moveTo(px(p.x),py(p.y)));c.closePath();c.stroke()});c.restore()}
+      WARN.filter(wn=>wn.sev==='bad'&&wn.poses&&wn.key.startsWith('rr')).forEach(wn=>{c.save();c.strokeStyle=alpha(CV['--bad'],0.55);c.lineWidth=1.5;c.setLineDash([3,3]);wn.poses.forEach(q=>{const cs=corners(q.p,q.R.w,q.R.l);c.beginPath();cs.forEach((p,i)=>i?c.lineTo(px(p.x),py(p.y)):c.moveTo(px(p.x),py(p.y)));c.closePath();c.stroke()});c.restore()});
+      drawPaths(c);
+      const tNow=state.time;
+      RES.forEach((res,ri)=>{const R=res.R;if(R.hidden||(R.kind==='ghost'&&state.mode!=='match'))return;const p=poseAt(res,tNow);
+        const hit=WARN.some(wn=>wn.key.startsWith('rr')&&wn.key.includes(R.id)&&tNow>=wn.t0-1e-6&&tNow<=wn.t1+1e-6);
+        drawRobot(fieldCv.getContext('2d'),R,p,{label:true,hold:sc.hold[R.id],lw:ri===state.active?2.5:1.5});
+        if(hit){c.save();c.strokeStyle=CV['--bad'];c.lineWidth=3;const cs=corners(p,R.w,R.l);c.beginPath();cs.forEach((q,i)=>i?c.lineTo(px(q.x),py(q.y)):c.moveTo(px(q.x),py(q.y)));c.closePath();c.stroke();c.restore()}});
+    }
+    drawTimeline();drawVel();updateTransport();
+    if(state.tab==='score'&&!state.playing)renderPanel();
+  }
+
+  /* ---------------- Timeline ---------------- */
+  const TL={lab:58,top:20,tr:24};
+  function tlRobots(){return RES.filter(r=>!r.R.hidden&&(r.R.kind==='ours'||state.mode==='match'))}
+  function drawTimeline(){
+    const rs=tlRobots();tlCv.style.height=(TL.top+rs.length*TL.tr+8)+'px';
+    const {c,w,h}=fit(tlCv);c.clearRect(0,0,w,h);const Tm=maxT()*1.04,X=t=>TL.lab+(t/Tm)*(w-TL.lab-8);
+    c.font='10px Geist Mono, monospace';c.fillStyle=CV['--muted'];c.textAlign='center';c.strokeStyle=CV['--line'];c.lineWidth=1;
+    const step=Tm>40?5:Tm>15?2:1;for(let t=0;t<=Tm;t+=step){c.beginPath();c.moveTo(X(t),TL.top-4);c.lineTo(X(t),h);c.stroke();c.fillText(t+'s',X(t),11)}
+    rs.forEach((res,i)=>{const y=TL.top+i*TL.tr,R=res.R,col=rcol(R);c.textAlign='left';c.fillStyle=CV['--ink'];c.font='600 11px Public Sans, system-ui, sans-serif';c.fillText(R.kind==='ghost'?R.name:R.name.replace('Robot ','R'),4,y+14);
+      c.fillStyle=CV['--panel2'];c.fillRect(X(0),y+3,X(res.end)-X(0),TL.tr-8);
+      res.blocks.forEach(b=>{const x1=X(b.t0),x2=Math.max(X(b.t1),x1+1.5);
+        if(b.k==='drive'){c.fillStyle=alpha(col,b.rev?0.4:0.7);c.fillRect(x1,y+3,x2-x1,TL.tr-11)}
+        else if(b.k==='turn'){c.fillStyle=alpha(col,0.25);c.fillRect(x1,y+3,x2-x1,TL.tr-11);c.save();c.beginPath();c.rect(x1,y+3,x2-x1,TL.tr-11);c.clip();c.strokeStyle=alpha(col,0.8);c.lineWidth=1;for(let k=x1-20;k<x2;k+=5){c.beginPath();c.moveTo(k,y+TL.tr-8);c.lineTo(k+10,y+3);c.stroke()}c.restore()}
+        else if(b.k==='act'){c.fillStyle=CV[KINDS[b.a.kind].color];c.fillRect(x1,y+3,x2-x1,TL.tr-11)}
+        else if(b.k==='actm'){c.fillStyle=CV[KINDS[b.a.kind].color];c.fillRect(x1,y+TL.tr-7,x2-x1,3)}});
+    });
+    c.strokeStyle=CV['--bad'];c.lineWidth=2;c.beginPath();c.moveTo(X(state.autonLen),TL.top-6);c.lineTo(X(state.autonLen),h);c.stroke();
+    c.strokeStyle=CV['--ink'];c.lineWidth=1.5;c.beginPath();c.moveTo(X(state.time),TL.top-6);c.lineTo(X(state.time),h);c.stroke();
+    c.fillStyle=CV['--ink'];c.beginPath();c.moveTo(X(state.time)-5,TL.top-10);c.lineTo(X(state.time)+5,TL.top-10);c.lineTo(X(state.time),TL.top-3);c.fill();
+    tlCv._X=X;tlCv._Tm=Tm;
+  }
+  function drawVel(){
+    const {c,w,h}=fit(velCv);c.clearRect(0,0,w,h);const res=resOf(active());if(!res)return;
+    const pl=40,pr=10,pt=10,pb=22,Tm=maxT()*1.04,vmax=Math.max(res.P.vTheo,res.P.v)*1.08;
+    const X=t=>pl+t/Tm*(w-pl-pr),Y=v=>pt+(1-(v+vmax)/(2*vmax))*(h-pt-pb);
+    c.strokeStyle=CV['--line'];c.fillStyle=CV['--muted'];c.font='10px Geist Mono, monospace';c.lineWidth=1;c.textAlign='right';
+    const vs=vmax>60?20:10;for(let v=-Math.floor(vmax/vs)*vs;v<=vmax;v+=vs){c.strokeStyle=v===0?CV['--muted']:CV['--line'];c.beginPath();c.moveTo(pl,Y(v));c.lineTo(w-pr,Y(v));c.stroke();c.fillText(v,pl-4,Y(v)+3)}
+    c.textAlign='center';const step=Tm>40?5:Tm>15?2:1;for(let t=0;t<=Tm;t+=step)c.fillText(t+'s',X(t),h-6);
+    c.save();c.translate(10,pt+(h-pt-pb)/2);c.rotate(-Math.PI/2);c.fillText('wheel in/s',0,0);c.restore();
+    c.setLineDash([5,4]);c.strokeStyle=CV['--muted'];[res.P.v,-res.P.v].forEach(v=>{c.beginPath();c.moveTo(pl,Y(v));c.lineTo(w-pr,Y(v));c.stroke()});c.setLineDash([]);
+    c.fillStyle=CV['--muted'];c.textAlign='left';c.fillText(`max ±${f1(res.P.v)}`,pl+4,Y(res.P.v)-4);
+    const ctr=q=>q.rev?-q.v:q.v;
+    c.beginPath();c.moveTo(X(0),Y(0));res.S.forEach(q=>c.lineTo(X(q.t),Y(ctr(q))));c.lineTo(X(res.S.at(-1).t),Y(0));c.closePath();c.fillStyle=alpha(rcol(res.R),0.16);c.fill();
+    const line=(key,col,dash)=>{c.strokeStyle=col;c.lineWidth=2;c.setLineDash(dash);c.beginPath();res.S.forEach((q,i)=>i?c.lineTo(X(q.t),Y(q[key])):c.moveTo(X(q.t),Y(q[key])));c.stroke();c.setLineDash([])};
+    line('vL',CV['--sideL'],[]);line('vR',CV['--sideR'],[6,3]);
+    c.strokeStyle=CV['--bad'];c.lineWidth=1.5;c.beginPath();c.moveTo(X(state.autonLen),pt);c.lineTo(X(state.autonLen),h-pb);c.stroke();
+    c.strokeStyle=CV['--ink'];c.beginPath();c.moveTo(X(state.time),pt);c.lineTo(X(state.time),h-pb);c.stroke();
+    const p=poseAt(res,state.time);[[p.vL,CV['--sideL']],[p.vR,CV['--sideR']]].forEach(([v,col])=>{c.fillStyle=col;c.beginPath();c.arc(X(state.time),Y(v),3.5,0,7);c.fill()});
+    const rpm=v=>Math.round(Math.abs(v)/(Math.PI*res.R.params.wheel)*60);
+    $('#velCap').innerHTML=`${esc(active().name)} now: <b style="color:var(--sideL)">Left ${f1(p.vL)}</b> · <b style="color:var(--sideR)">right ${f1(p.vR)}</b> in/s (${rpm(p.vL)} / ${rpm(p.vR)} wheel rpm) · shaded = robot center speed`;
+  }
+
+  /* ---------------- Transport, budget ---------------- */
+  const $=s=>root.querySelector(s);
+  const ICON={play:'<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.5v9l7-4.5z"/></svg>',pause:'<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5v9M10.5 3.5v9"/></svg>',
+    x:'<svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',check:'<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.5l2.2 2.2L9.5 3.5"/></svg>',
+    alert:'<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 3v3.5M6 9h.01"/></svg>',chev:'<svg class="v-acc-chevron" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7.5l5 5 5-5"/></svg>'};
+  const fieldCv=$('#field'),tlCv=$('#timeline'),velCv=$('#vel');
+  function updateTransport(){
+    $('#clock').innerHTML=`${f2(state.time)} <small>/ ${state.autonLen} s</small>`;
+    {const pb=$('#playBtn'),want=state.playing?'pause':'play';if(pb.dataset.s!==want){pb.dataset.s=want;pb.innerHTML=state.playing?ICON.pause+'Pause':ICON.play+'Play';pb.setAttribute('aria-label',state.playing?'Pause':'Play')}}
+    const sc=scoreAt(state.time),end=scoreAt(state.autonLen),ally=state.alliance;
+    let bonus='';if(state.mode==='match'){const ap=end.ourPts+end.midPts,d=ap-state.opp;bonus=d>0?`<span class="pill good">${ICON.check}Bonus +12 · ${ap} vs ${state.opp}</span>`:d===0?`<span class="pill warn">${ICON.alert}Bonus tie · +6</span>`:`<span class="pill bad">${ICON.alert}No bonus · ${ap} vs ${state.opp}</span>`;const n=end.awp.filter(x=>x.ok).length;bonus+=`<span class="pill ${n===4?'good':'warn'}">${n===4?ICON.check:ICON.alert}AWP ${n}/4</span>`}
+    const nb=WARN.filter(w=>w.sev==='bad').length,nw=WARN.length-nb;
+    $('#scoreline').innerHTML=`<span class="scorebig" style="color:var(--${ally})">${sc.ourPts+sc.midPts}</span><span class="hint">now · ${sc.ourPts} scored${sc.midPts?` + ${sc.midPts} midfield`:''}</span>${bonus}<span class="pill ${nb?'bad':nw?'warn':'good'}">${nb+nw?ICON.alert:ICON.check}${nb+nw?`${nb} conflicts · ${nw} warnings`:'No conflicts'}</span>`;
+  }
+  function renderBudget(){
+    const rs=RES.filter(r=>!r.R.hidden&&r.R.kind==='ours');
+    $('#budget').innerHTML=rs.map(r=>{const used=r.end,slack=state.autonLen-used,pct=clamp(used/state.autonLen*100,0,100),col=slack<0?'var(--bad)':slack<2?'var(--warn)':'var(--good)';
+      return`<div class="brow"><span><span class="dot" style="background:${rcol(r.R)}"></span> ${r.R.name}</span><div class="btrack"><div class="bfill" style="width:${pct}%;background:${col}"></div></div><span class="btext" style="color:${col}">${f1(used)} s · ${slack>=0?f1(slack)+' s slack':f1(-slack)+' s over'}</span></div>`}).join('');
+  }
+
+  /* ---------------- Units ---------------- */
+  const posTo=v=>state.units==='gps'?v*MM:state.units==='tile'?(v+HALF)/24:v;
+  const posFrom=v=>state.units==='gps'?v/MM:state.units==='tile'?v*24-HALF:v;
+  const posStep=()=>state.units==='gps'?10:state.units==='tile'?0.05:0.5;
+  const uLbl=()=>state.units==='gps'?'mm':state.units==='tile'?'tile':'in';
+  const fmtPos=(x,y)=>state.units==='gps'?`(${Math.round(x*MM)}, ${Math.round(y*MM)}) mm`:state.units==='tile'?`(${f2(posTo(x))}, ${f2(posTo(y))}) tiles`:`(${f1(x)}, ${f1(y)}) in`;
+
+  /* ---------------- Side panel ---------------- */
+  const esc=s=>String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));
+  const numRow=(label,bind,val,unit,step=1,extra='')=>`<label for="i_${bind}">${label}</label><span><input type="number" id="i_${bind}" data-bind="${bind}" value="${val}" step="${step}" ${extra}><span class="u">${unit}</span></span>`;
+  function renderPanel(){
+    root.querySelectorAll('#tabs button').forEach(b=>b.setAttribute('aria-selected',b.dataset.tab===state.tab));
+    const R=active(),res=resOf(R),pn=$('#panel');let h='';
+    if(state.tab==='robot'){const p=R.params,P=res.P;
+      const acc=(id,title,meta,body)=>{const open=!!state.acc[id];return`<div class="v-acc-item" data-open="${open}"><button class="v-acc-trigger" data-acc="${id}" aria-expanded="${open}" aria-controls="acc-${id}"><span>${title}</span><small>${meta}</small>${ICON.chev}</button><div class="v-acc-panel" id="acc-${id}" role="region"><div class="v-acc-inner"><div class="v-acc-body">${body}</div></div></div></div>`};
+      h+=`<div><h4>${esc(R.name)}${R.kind==='ghost'?' · opponent ghost':''}</h4><div class="rows">
+        <label for="i_name">Name</label><input type="text" id="i_name" data-bind="robot.name" value="${esc(R.name)}" style="width:160px">
+        <label for="i_size">Footprint</label><select id="i_size" data-bind="robot.size"><option value="15" ${R.w===15&&R.l===15?'selected':''}>15 × 15 in</option><option value="18" ${R.w===18&&R.l===18?'selected':''}>18 × 18 in</option><option value="24" ${R.w===24&&R.l===24?'selected':''}>24 × 24 in</option><option value="c" ${![15,18,24].includes(R.w)||R.w!==R.l?'selected':''}>Custom</option></select>
+        ${numRow('Width','robot.w',R.w,'in',0.5,'min="4" max="30"')}${numRow('Length','robot.l',R.l,'in',0.5,'min="4" max="30"')}
+        ${R.kind==='ghost'?`<label for="i_hid">Show on field</label><input type="checkbox" id="i_hid" data-bind="robot.show" ${R.hidden?'':'checked'}>`:''}
+      </div></div>
+      <div class="v-accordion">
+      ${acc('drive','Drivetrain',`${Math.round(P.wheelRpm)} rpm · ${p.wheel} in`,`<div class="rows">
+        ${numRow('Wheel diameter','p.wheel',p.wheel,'in',0.25,'min="1"')}
+        <label for="i_cart">Motor cartridge</label><select id="i_cart" data-bind="p.cart"><option value="100" ${p.cart==100?'selected':''}>100 rpm (red)</option><option value="200" ${p.cart==200?'selected':''}>200 rpm (green)</option><option value="600" ${p.cart==600?'selected':''}>600 rpm (blue)</option></select>
+        ${numRow('Gear: motor teeth','p.gIn',p.gIn,'T',1,'min="1"')}${numRow('Gear: wheel teeth','p.gOut',p.gOut,'T',1,'min="1"')}
+        ${numRow('Drive motors (total, split L/R)','p.motors',p.motors,'',2,'min="2" max="16"')}${numRow('Robot mass','p.mass',p.mass,'lb',0.5,'min="1"')}
+        ${numRow('Efficiency','p.eff',p.eff,'%',1,'min="30" max="100"')}${numRow('Track width (wheel center to center)','p.track',p.track,'in',0.25,'min="4"')}
+      </div>
+      <div class="readout">Wheel speed <b>${Math.round(P.wheelRpm)} rpm</b><br>Theoretical top <b>${f1(P.vTheo)} in/s</b> (${f1(P.vTheo/12)} ft/s)<br>Derived top <b>${f1(P.vDer)} in/s</b> at ${p.eff}%<br>Derived accel <b>${Math.round(P.aDer)} in/s²</b>, ${P.limit}-limited</div>`)}
+      ${acc('motion','Motion limits',`${f1(P.v)} in/s · ${Math.round(P.a)} in/s²`,`<div class="rows">
+        <label for="i_vm">Top speed</label><select id="i_vm" data-bind="p.vMode" data-rerender><option value="derived" ${p.vMode==='derived'?'selected':''}>Derived · ${f1(P.vDer)}</option><option value="manual" ${p.vMode==='manual'?'selected':''}>Manual</option></select>
+        ${p.vMode==='manual'?numRow('Manual top speed','p.vMan',p.vMan,'in/s',1,'min="1"'):''}
+        <label for="i_am">Acceleration</label><select id="i_am" data-bind="p.aMode" data-rerender><option value="derived" ${p.aMode==='derived'?'selected':''}>Derived · ${Math.round(P.aDer)}</option><option value="manual" ${p.aMode==='manual'?'selected':''}>Manual</option></select>
+        ${p.aMode==='manual'?numRow('Manual accel','p.aMan',p.aMan,'in/s²',5,'min="1"'):''}
+        ${numRow('Point-turn scrub factor','p.turnPct',p.turnPct,'%',5,'min="5" max="100"')}
+        <label for="i_curv">Slow down on tight curves</label><input type="checkbox" id="i_curv" data-bind="p.curv" ${p.curv?'checked':''}>
+        ${numRow('Max lateral accel','p.aLat',p.aLat,'in/s²',10,'min="10"')}
+      </div>
+      <div class="readout">Point turn max <b>${Math.round(P.wMax/D2R)} °/s</b> · 90° turn <b>${f2(trap(Math.PI/2,P.wMax,P.alpha).dur)} s</b><br>Max center speed with the outer side at full speed:<br>12 in radius <b>${f1(P.v*12/(12+P.half))}</b> · 24 in <b>${f1(P.v*24/(24+P.half))}</b> · 48 in <b>${f1(P.v*48/(48+P.half))}</b> in/s</div>`)}
+      ${acc('start','Start pose',`${fmtPos(R.start.x,R.start.y)} · ${f1(R.start.h)}°`,`<div class="rows">${numRow('X','start.x',+posTo(R.start.x).toFixed(2),uLbl(),posStep())}${numRow('Y','start.y',+posTo(R.start.y).toFixed(2),uLbl(),posStep())}${numRow('Heading','start.h',+R.start.h.toFixed(1),'°',5)}</div>
+      <p class="hint">Heading 0° faces the top wall and 90° faces the blue station. You can also drag the knob in front of the robot to rotate it.</p>`)}
+      </div>`;
+      if(R.kind==='ghost')h+=`<div><button class="btn ghost danger" data-act="delGhost">Remove this ghost</button></div>`;
+    }
+    else if(state.tab==='path'){const wps=[R.start,...R.segs];const sel=clamp(state.sel??0,0,R.segs.length);
+      h+=`<p class="hint">Pick <b>Line</b> or <b>Bezier</b> in the toolbar, then click the field to add waypoints for <b style="color:${rcol(R)}">${esc(R.name)}</b>. Drag points and handles with <b>Select</b>. Dashed path = driving in reverse.</p>`;
+      if(sel>0){const s=R.segs[sel-1],inf=res.segInfo[sel-1]||{len:0,t0:0,t1:0};
+        h+=`<div><h4>Waypoint ${sel}</h4><div class="rows">
+          <label for="i_type">Segment into it</label><div class="seg" id="i_type"><button data-act="segType" data-v="line" aria-pressed="${s.type==='line'}">Line</button><button data-act="segType" data-v="bezier" aria-pressed="${s.type==='bezier'}">Bezier</button></div>
+          ${numRow('X','seg.x',+posTo(s.x).toFixed(2),uLbl(),posStep())}${numRow('Y','seg.y',+posTo(s.y).toFixed(2),uLbl(),posStep())}
+          <label for="i_rev">Drive in reverse</label><input type="checkbox" id="i_rev" data-bind="seg.rev" ${s.rev?'checked':''}>
+          <label for="i_lock">Lock end heading</label><input type="checkbox" id="i_lock" data-bind="seg.lockOn" data-rerender ${s.lock!=null?'checked':''}>
+          ${s.lock!=null?numRow('End heading','seg.lock',+s.lock.toFixed(1),'°',5):''}
+          ${numRow('Speed cap','seg.spd',s.spd,'%',5,'min="5" max="100"')}
+        </div>
+        <div class="readout" style="margin-top:8px">Length <b>${f1(inf.len)} in</b> · drive <b>${f2(inf.t1-inf.t0)} s</b><br>Arrives at <b>${f2(inf.t1)} s</b></div>
+        <div class="flexrow" style="margin-top:8px"><button class="btn" data-act="tab" data-v="actions">Actions here (${R.actions.filter(a=>a.wp===sel).length})</button><button class="btn danger" data-act="delWp">Delete waypoint</button></div></div>`}
+      else h+=`<div><h4>Start</h4><p class="hint">${fmtPos(R.start.x,R.start.y)} · heading ${f1(R.start.h)}°. Edit the exact pose in the Robot tab.</p></div>`;
+      h+=`<div><h4>Waypoints</h4><div class="list">${wps.map((w,i)=>{const inf=i?res.segInfo[i-1]:null;const na=R.actions.filter(a=>a.wp===i).length;
+        return`<button class="li" data-act="selWp" data-v="${i}" aria-current="${i===sel}"><span class="n">${i}</span><span>${i?(R.segs[i-1].type==='line'?'Line':'Bezier')+(R.segs[i-1].rev?' · rev':''):'Start'}${na?` · ${na} action${na>1?'s':''}`:''}</span><span class="m">${inf?f2(inf.t1)+' s':fmtPos(w.x,w.y)}</span></button>`}).join('')}</div></div>
+      <div><h4>Motion sim</h4><p class="hint">Turn this route into simulator commands: lines become Move to point, Bezier runs become one Follow path, heading locks become turns, and waiting actions become waits.</p>
+        <div class="flexrow" style="margin-top:var(--space-2)"><button class="btn" data-act="toSim" ${R.segs.length?'':'disabled'}>Simulate this route</button></div></div>
+      <div class="flexrow"><button class="btn ghost danger" data-act="clearPath">Clear path</button></div>`;
+    }
+    else if(state.tab==='actions'){
+      if(R.kind==='ghost'){h+=`<p class="hint">Opponent ghosts only take up space so you can see where their route could meet yours. They don't score.</p>`}
+      else{const sel=clamp(state.sel??0,0,R.segs.length),here=R.actions.filter(a=>a.wp===sel);
+        h+=`<div><h4>At waypoint ${sel}${sel?'':' (start)'}</h4><div style="display:grid;gap:8px">${here.map(a=>actCard(a)).join('')||'<p class="hint">No actions here yet.</p>'}</div>
+        <div class="flexrow" style="margin-top:8px"><select id="newKind" aria-label="Action type">${Object.entries(KINDS).map(([k,v])=>`<option value="${k}">${v.name}</option>`).join('')}</select><button class="btn" data-act="addAct">Add action</button></div>
+        <p class="hint" style="margin-top:6px"><b>Wait</b> stops the robot until the action finishes. <b>While moving</b> starts it as the robot leaves this point.</p></div>
+        <div><h4>${esc(R.name)} run order</h4><div class="list">${res.events.map((e,k)=>`<button class="li" data-act="jump" data-t="${e.t0}" data-wp="${e.wi}"><span class="n">${k+1}</span><span><span class="dot" style="background:${CV[KINDS[e.a.kind].color]}"></span> ${actLabel(e.a)}</span><span class="m">${f2(e.t0)}–${f2(e.t1)} s</span></button>`).join('')||'<p class="hint" style="padding:8px">No actions yet.</p>'}</div></div>`}
+    }
+    else if(state.tab==='score'){const sc=scoreAt(state.time),end=scoreAt(state.autonLen);
+      h+=`<div><h4>${state.mode==='match'?'Autonomous':'Skills'} score at ${f2(state.time)} s</h4><table class="table">
+        <tr><td>Scored pin halves</td><td>${sc.ourPts}</td></tr><tr><td>Robots in Midfield (${sc.midO} × 8)</td><td>${sc.midPts}</td></tr><tr><td><b>Total</b></td><td><b>${sc.ourPts+sc.midPts}</b></td></tr></table></div>
+        <div><h4>Toggles</h4><div class="flexrow">${TOGGLES.map(t=>`<span class="pill" style="border-color:${allyCol(sc.toggles[t.id])}"><span class="dot" style="background:${allyCol(sc.toggles[t.id])}"></span> ${t.name.replace(' wall toggle','')}</span>`).join('')}</div>
+        <p class="hint" style="margin-top:6px">Midfield yellow pins: ${sc.midOwner?`owned by ${sc.midOwner} (${sc.midO} vs ${sc.midG} robots)`:'not owned (tied robot count)'}.</p></div>
+        <div><h4>Scored so far</h4><table class="table">${sc.brk.map(b=>`<tr><td>${PINS[b.pin].name} on ${b.goal.name}${b.field?' (starts there)':''} · ${b.vis.length?b.vis.join(' + ')+' visible':'covered'}${b.vis.includes('yellow')&&!b.owner?', yellow unowned':''}</td><td>+${b.gain}</td></tr>`).join('')||'<tr><td>Nothing scored yet at this time</td><td></td></tr>'}</table></div>`;
+      if(state.mode==='match')h+=`<div><h4>Autonomous bonus</h4><div class="rows">${numRow('Expected opponent auton points','st.opp',state.opp,'pts',1,'min="0"')}</div>
+        <p class="hint" style="margin-top:6px">At ${state.autonLen} s you have <b>${end.ourPts+end.midPts}</b>, including Midfield robots and Midfield yellow Pins as VEX U rule VUG5 counts them. ${end.ourPts+end.midPts>state.opp?'You win the 12-point bonus.':end.ourPts+end.midPts===state.opp?'Tie: 6 points each.':'The opponent wins the bonus.'}</p></div>
+        <div><h4>Autonomous Win Point · VUG6 at ${state.autonLen} s</h4><div class="list">${end.awp.map(x=>`<div class="wrow" style="cursor:default"><span class="sev" style="background:var(--${x.ok?'good':'bad'})"></span><span>${x.txt}</span><span class="m">${x.ok?'met':'not met'}</span></div>`).join('')}</div></div>`;
+      h+=`<div><h4>Conflicts & warnings</h4><div class="list">${WARN.map((w,k)=>`<button class="wrow" data-act="warn" data-k="${k}"><span class="sev" style="background:var(--${w.sev})"></span><span>${esc(w.msg)}</span><span class="m">${f1(w.t0)}${w.t1>w.t0+0.06?'–'+f1(w.t1):''} s</span></button>`).join('')||'<p class="hint" style="padding:8px">No overlaps, clipped elements, or line crossings.</p>'}</div>
+        <p class="hint" style="margin-top:6px">Collision checks use each robot's rectangle footprint every 0.05 s. A goal you're scoring on is ignored for 1.5 s before its action.</p></div>`;
+    }
+    else if(state.tab==='saves'){const lib=libLoad().filter(e=>!e.kind||e.kind===R.kind);
+      h+=`<div><h4>Image export</h4><p class="hint">Full routes for every robot with numbered action markers and a key.</p><div class="flexrow" style="margin-top:6px"><button class="btn" data-act="exportImg">Export route image</button></div></div>
+        <div><h4>Route library · ${esc(R.name)}</h4><div class="flexrow"><input type="text" id="libName" placeholder="e.g. Left side 4-pin" style="flex:1"><button class="btn" data-act="libSave">Save route</button></div>
+        <div class="list" style="margin-top:8px">${lib.map(e=>`<div class="li" style="cursor:default"><span class="n">${e.size}"</span><span>${esc(e.name)}<br><span class="m">${esc(e.robot)} · ${new Date(e.at).toLocaleDateString()}</span></span><span class="flexrow"><button class="btn" data-act="libLoad" data-id="${e.id}">Load</button><button class="btn ghost icon danger" data-act="libDel" data-id="${e.id}" aria-label="Delete saved route">${ICON.x}</button></span></div>`).join('')||'<p class="hint" style="padding:8px">Saved routes stay in this browser. Download the project JSON for a copy you can share or commit.</p>'}</div></div>
+        <div><h4>Project JSON</h4><div class="flexrow"><button class="btn" data-act="jsonOut">Show project JSON</button><button class="btn" data-act="jsonDl">Download .json</button><button class="btn" data-act="jsonCopy">Copy JSON</button><label class="btn" for="fileIn">Load .json file</label><input type="file" id="fileIn" accept=".json,application/json" hidden></div>
+        <textarea id="jsonBox" placeholder="Paste project JSON here, then Load"></textarea><div class="flexrow" style="margin-top:6px"><button class="btn" data-act="jsonIn">Load from text</button><span class="hint" id="jsonMsg"></span></div></div>`;
+    }
+    pn.innerHTML=h;tagTips(pn);
+  }
+  function actLabel(a){const k=KINDS[a.kind].name;const gn=id=>(GOALS.find(q=>q.id===id)||{}).name||id;
+    if(a.kind==='scorePin')return`${k} (${a.pin==='held'?'held':PINS[a.pin].name}) → ${gn(a.goal)}`;
+    if(a.kind==='scoreCup')return`${k} → ${gn(a.goal)}`;
+    if(a.kind==='intakePin')return`${k} (${PINS[a.pin==='held'?'yy':a.pin].name})`;
+    if(a.kind==='toggle')return`${k} · ${(TOGGLES.find(t=>t.id===a.toggle)||{}).name}`;
+    if(a.kind==='custom')return a.label||'Custom action';return k}
+  function actCard(a){const id=a.id;const gopts=GOALS.map(q=>`<option value="${q.id}" ${a.goal===q.id?'selected':''}>${q.name}</option>`).join('');
+    const popts=(held)=>(held?[['held','Held pin']]:[]).concat(Object.entries(PINS).map(([k,v])=>[k,v.name])).map(([k,v])=>`<option value="${k}" ${a.pin===k?'selected':''}>${v}</option>`).join('');
+    let f='';
+    if(a.kind==='scorePin'){const ptype=a.pin==='held'?null:a.pin,hn=ptype?PINS[ptype].h:['colored','yellow'],up=a.up??0,vis=a.vis||'top';
+      f=`<label>Goal</label><select data-bind="act:${id}.goal">${gopts}</select><label>Pin</label><select data-bind="act:${id}.pin">${popts(true)}</select>
+      <label>Half facing up</label><select data-bind="act:${id}.up"><option value="0" ${up==0?'selected':''}>${hn[0][0].toUpperCase()+hn[0].slice(1)} half</option><option value="1" ${up==1?'selected':''}>${hn[1][0].toUpperCase()+hn[1].slice(1)} half</option></select>
+      <label>Visible halves</label><select data-bind="act:${id}.vis"><option value="top" ${vis==='top'?'selected':''}>Upper only (lower sits in goal)</option><option value="both" ${vis==='both'?'selected':''}>Both (lower in a clear cup half)</option><option value="none" ${vis==='none'?'selected':''}>None (covered by a cup)</option></select>`}
+    if(a.kind==='scoreCup')f=`<label>Goal</label><select data-bind="act:${id}.goal">${gopts}</select>`;
+    if(a.kind==='intakePin')f=`<label>Pin</label><select data-bind="act:${id}.pin">${popts(false)}</select>`;
+    if(a.kind==='toggle')f=`<label>Toggle</label><select data-bind="act:${id}.toggle">${TOGGLES.map(t=>`<option value="${t.id}" ${a.toggle===t.id?'selected':''}>${t.name}</option>`).join('')}</select>`;
+    if(a.kind==='custom')f=`<label>Label</label><input type="text" data-bind="act:${id}.label" value="${esc(a.label)}" placeholder="Clamp, wing out…" style="width:150px">`;
+    return`<div class="actcard"><div class="top"><span class="chip"><span class="dot" style="background:${CV[KINDS[a.kind].color]}"></span>${KINDS[a.kind].name}</span><button class="btn ghost icon danger" data-act="delAct" data-id="${id}" aria-label="Delete action">${ICON.x}</button></div>
+      <div class="rows">${f}<label>Duration</label><span><input type="number" data-bind="act:${id}.dur" value="${a.dur}" step="0.1" min="0"><span class="u">s</span></span>
+      <label>Robot</label><select data-bind="act:${id}.mode"><option value="wait" ${a.mode==='wait'?'selected':''}>Waits</option><option value="moving" ${a.mode==='moving'?'selected':''}>While moving</option></select></div></div>`}
+
+  /* ---------------- Panel bindings ---------------- */
+  function bindSet(el){
+    const R=active(),b=el.dataset.bind,raw=el.type==='checkbox'?el.checked:el.value,num=parseFloat(raw);
+    if(b.startsWith('act:')){const [id,key]=b.slice(4).split('.');const a=R.actions.find(q=>q.id===id);if(!a)return;a[key]=key==='dur'?Math.max(0,num||0):key==='up'?+raw:raw;if(key==='vis'||key==='up')delete a.halves;return}
+    const sel=clamp(state.sel??0,0,R.segs.length),s=sel?R.segs[sel-1]:null;
+    switch(b){
+      case'robot.name':R.name=raw||R.name;break;
+      case'robot.size':if(raw!=='c'){R.w=R.l=+raw}break;
+      case'robot.w':if(num>0)R.w=num;break;case'robot.l':if(num>0)R.l=num;break;
+      case'robot.show':R.hidden=!raw;break;
+      case'start.x':if(!isNaN(num))R.start.x=clamp(posFrom(num),-HALF,HALF);break;
+      case'start.y':if(!isNaN(num))R.start.y=clamp(posFrom(num),-HALF,HALF);break;
+      case'start.h':if(!isNaN(num))R.start.h=norm(num);break;
+      case'seg.x':if(s&&!isNaN(num)){moveWp(R,sel,clamp(posFrom(num),-HALF,HALF),s.y)}break;
+      case'seg.y':if(s&&!isNaN(num)){moveWp(R,sel,s.x,clamp(posFrom(num),-HALF,HALF))}break;
+      case'seg.rev':if(s)s.rev=raw;break;
+      case'seg.lockOn':if(s){s.lock=raw?Math.round(resOf(R).S.filter(q=>q.k==='drive'&&q.seg===sel-1).at(-1)?.h??0):null}break;
+      case'seg.lock':if(s&&!isNaN(num))s.lock=norm(num);break;
+      case'seg.spd':if(s&&num>0)s.spd=clamp(num,1,100);break;
+      case'st.opp':state.opp=Math.max(0,num||0);break;
+      default:if(b.startsWith('p.')){const k=b.slice(2),p=R.params;if(['vMode','aMode'].includes(k))p[k]=raw;else if(k==='curv')p.curv=raw;else if(!isNaN(num)&&num>=0)p[k]=num}
+    }
+  }
+  const panel=$('#panel');
+  panel.addEventListener('input',e=>{const el=e.target;if(!el.dataset.bind||el.tagName==='SELECT'||el.type==='checkbox')return;bindSet(el);recompute()});
+  panel.addEventListener('change',e=>{const el=e.target;if(el.id==='fileIn'){readFile(el);return}if(!el.dataset.bind)return;bindSet(el);recompute();if(el.tagName==='SELECT'||el.type==='checkbox'||el.dataset.rerender!=null)renderPanel();else if(state.tab==='robot'||state.tab==='path')renderPanel()});
+  panel.addEventListener('click',e=>{const t=e.target.closest('.v-acc-trigger');if(t){const it=t.closest('.v-acc-item'),open=it.getAttribute('data-open')!=='true';it.setAttribute('data-open',String(open));t.setAttribute('aria-expanded',String(open));state.acc[t.dataset.acc]=open;return}
+    const b=e.target.closest('[data-act]');if(!b)return;const R=active(),act=b.dataset.act,sel=clamp(state.sel??0,0,R.segs.length);
+    switch(act){
+      case'selWp':state.sel=+b.dataset.v;break;
+      case'tab':state.tab=b.dataset.v;break;
+      case'segType':{const s=R.segs[sel-1];if(s){s.type=b.dataset.v;if(s.type==='bezier'&&!s.c1){const p0=sel>1?R.segs[sel-2]:R.start;s.c1={x:p0.x+(s.x-p0.x)/3,y:p0.y+(s.y-p0.y)/3};s.c2={x:p0.x+(s.x-p0.x)*2/3,y:p0.y+(s.y-p0.y)*2/3}}}break}
+      case'delWp':confirmDelete(`Delete waypoint ${sel}?`,`Its segment and ${R.actions.filter(a=>a.wp===sel).length} action(s) at this waypoint will be removed.`,()=>{delWp(R,sel);recompute();renderPanel();renderRobotSeg()});return;
+      case'clearPath':confirmDelete(`Clear ${R.name}'s whole path?`,`All ${R.segs.length} waypoints and their actions will be removed. The start pose stays.`,()=>{R.segs=[];R.actions=R.actions.filter(a=>a.wp===0);state.sel=0;recompute();renderPanel();renderRobotSeg()});return;
+      case'addAct':{const k=$('#newKind').value;const o={scorePin:{goal:'C',dur:0.7},scoreCup:{goal:'C',dur:0.6},intakePin:{pin:'yy',dur:0.4},intakeCup:{dur:0.4},toggle:{toggle:nearToggle(R,sel),dur:0.8},custom:{label:'',dur:0.3}}[k];R.actions.push(A(sel,k,o));break}
+      case'delAct':{const id=b.dataset.id,a=R.actions.find(q=>q.id===id);confirmDelete('Delete this action?',a?actLabel(a):'',()=>{R.actions=R.actions.filter(q=>q.id!==id);recompute();renderPanel();renderRobotSeg()});return}
+      case'jump':state.time=+b.dataset.t;state.sel=+b.dataset.wp;break;
+      case'warn':{const w=WARN[+b.dataset.k];state.time=w.t0;hover=w;setTimeout(()=>{hover=null;drawAll()},2200);break}
+      case'delGhost':confirmDelete(`Remove ${R.name}?`,'This opponent ghost and its path will be removed.',()=>{const i=state.robots.indexOf(R);if(i>=0)state.robots.splice(i,1);state.active=0;state.sel=0;recompute();renderPanel();renderRobotSeg()});return;
+      case'exportImg':exportImage();return;
+      case'libSave':libSave(R,$('#libName').value);break;
+      case'libLoad':{const e2=libLoad().find(q=>q.id===b.dataset.id);if(e2){const d=JSON.parse(JSON.stringify(e2.data));Object.assign(R,{w:d.w,l:d.l,params:d.params,start:d.start,segs:d.segs,actions:d.actions.map(a=>({...a,id:nid()}))});state.sel=0}break}
+      case'libDel':{const id=b.dataset.id,e2=libLoad().find(q=>q.id===id);confirmDelete('Delete this saved route?',e2?`“${e2.name}” will be removed from this browser's library.`:'',()=>{libStore(libLoad().filter(q=>q.id!==id));renderPanel()});return}
+      case'jsonOut':$('#jsonBox').value=JSON.stringify(projectJSON(),null,1);return;
+      case'jsonCopy':{const txt=JSON.stringify(projectJSON());$('#jsonBox').value=txt;const ok=()=>$('#jsonMsg').textContent='Copied.';const fb=()=>{$('#jsonBox').select();$('#jsonMsg').textContent='Copy blocked here. The JSON is selected in the box, press Ctrl/Cmd+C.'};try{navigator.clipboard.writeText(txt).then(ok,fb)}catch(_){fb()}return}
+      case'jsonIn':loadProject($('#jsonBox').value);return;
+      case'jsonDl':downloadBlob(new Blob([JSON.stringify(projectJSON(),null,1)],{type:'application/json'}),`override-auton-${new Date().toISOString().slice(0,10)}.json`);return;
+      case'toSim':hooks.simulate({robot:JSON.parse(JSON.stringify(R)),alliance:state.alliance,planned:resOf(R)?resOf(R).end:null});return;
+    }
+    recompute();renderPanel();
+  });
+  function nearToggle(R,sel){const p=sel?R.segs[sel-1]:R.start;let best='L',bd=1e9;TOGGLES.forEach(t=>{const d=dist(p,t);if(d<bd){bd=d;best=t.id}});return best}
+  function delWp(R,k){if(k<1)return;R.segs.splice(k-1,1);R.actions=R.actions.filter(a=>a.wp!==k).map(a=>a.wp>k?{...a,wp:a.wp-1}:a);state.sel=Math.min(k-1,R.segs.length)}
+  function moveWp(R,i,x,y){const p=i?R.segs[i-1]:R.start,dx=x-p.x,dy=y-p.y;p.x=x;p.y=y;
+    if(i&&R.segs[i-1].type==='bezier'){const s=R.segs[i-1];s.c2={x:s.c2.x+dx,y:s.c2.y+dy}}
+    const n=R.segs[i];if(n&&n.type==='bezier'){n.c1={x:n.c1.x+dx,y:n.c1.y+dy}}}
+
+  /* ---------------- Library & JSON ---------------- */
+  const LIBKEY='override-auton-planner-lib-v1';
+  function libLoad(){try{return JSON.parse(localStorage.getItem(LIBKEY)||'[]')}catch(_){return[]}}
+  function libStore(v){try{localStorage.setItem(LIBKEY,JSON.stringify(v))}catch(_){}}
+  function libSave(R,name){const lib=libLoad();lib.unshift({id:'L'+Date.now(),name:name||`${R.name} route`,robot:R.name,kind:R.kind,size:R.w,at:Date.now(),data:JSON.parse(JSON.stringify({w:R.w,l:R.l,params:R.params,start:R.start,segs:R.segs,actions:R.actions}))});libStore(lib)}
+  function projectJSON(){return{format:'override-auton-planner',v:1,mode:state.mode,autonLen:state.autonLen,alliance:state.alliance,opp:state.opp,robots:state.robots}}
+  function loadProject(txt){try{const d=JSON.parse(txt);if(!Array.isArray(d.robots)||!d.robots.length)throw new Error('No robots array found.');
+    d.robots.forEach(R=>{if(!R.start||!Array.isArray(R.segs)||!R.params)throw new Error('A robot is missing start, segs, or params.');R.actions=(R.actions||[]).map(a=>({...a,id:nid()}))});
+    Object.assign(state,{mode:d.mode||'match',autonLen:d.autonLen||30,alliance:d.alliance||'red',opp:d.opp??20,robots:d.robots,active:0,sel:0,time:0});
+    syncToolbar();recompute();renderPanel();const m=$('#jsonMsg');if(m)m.textContent='Project loaded.'}catch(err){const m=$('#jsonMsg');if(m)m.textContent='Could not load: '+err.message}}
+  function readFile(el){const f=el.files&&el.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#jsonBox').value=r.result;loadProject(r.result)};r.readAsText(f)}
+
+  /* ---------------- Image export ---------------- */
+  function exportImage(){
+    readVars();const W=1700,H=1150,cv=document.createElement('canvas');cv.width=W;cv.height=H;const c=cv.getContext('2d');
+    c.fillStyle=CV['--bg'];c.fillRect(0,0,W,H);const save=T;T={ox:40,oy:70,s:1040/144};
+    c.fillStyle=CV['--ink'];c.font='500 30px Public Sans, system-ui, sans-serif';c.fillText(`Override auton · ${state.alliance==='red'?'Red':'Blue'} alliance · ${state.mode==='match'?state.autonLen+' s autonomous':'Skills, '+state.autonLen+' s'}`,40,46);
+    const end=scoreAt(state.autonLen);drawField(c,end,{export:true});drawPaths(c,{export:true});
+    RES.forEach(res=>{const R=res.R;if(R.hidden||(R.kind==='ghost'&&state.mode!=='match'))return;drawRobot(c,R,res.S[0],{alpha:0.9,lw:2,label:true})});
+    let y=90;const lx=1120;c.textBaseline='alphabetic';
+    RES.forEach(res=>{const R=res.R;if(R.hidden||R.kind!=='ours')return;
+      c.fillStyle=rcol(R);c.fillRect(lx,y-14,14,14);c.fillStyle=CV['--ink'];c.font='500 21px Public Sans, sans-serif';c.fillText(`${R.name} · ${R.w} × ${R.l} in`,lx+22,y);y+=20;
+      c.font='15px Geist Mono, monospace';c.fillStyle=CV['--muted'];c.fillText(`${f1(res.end)} s used · ${f1(state.autonLen-res.end)} s slack · top ${f1(res.P.v)} in/s · accel ${Math.round(res.P.a)} in/s²`,lx,y);y+=24;
+      res.events.forEach((e,k)=>{icon(c,e.a.kind,lx+10,y-6,10,k+1,'#121212');c.fillStyle=CV['--ink'];c.font='17px Public Sans, sans-serif';let t=actLabel(e.a);if(t.length>44)t=t.slice(0,43)+'…';c.fillText(t,lx+28,y);c.fillStyle=CV['--muted'];c.font='15px Geist Mono, monospace';c.textAlign='right';c.fillText(`${f1(e.t0)} s${e.a.mode==='wait'?'':' moving'}`,W-30,y);c.textAlign='left';y+=28});
+      if(!res.events.length){c.fillStyle=CV['--muted'];c.fillText('No actions',lx,y);y+=24}y+=14});
+    y=Math.max(y,820);c.strokeStyle=CV['--line'];c.beginPath();c.moveTo(lx,y-16);c.lineTo(W-30,y-16);c.stroke();
+    c.fillStyle=CV['--ink'];c.font='400 14px Geist Mono, monospace';c.fillText('KEY',lx,y+2);y+=24;
+    const keyItems=Object.entries(KINDS);keyItems.forEach(([k,v],i)=>{const cx=lx+(i%2)*270,cy=y+Math.floor(i/2)*24;icon(c,k,cx+9,cy-5,8,null);c.fillStyle=CV['--ink'];c.font='14px Public Sans, sans-serif';c.fillText(v.name,cx+26,cy)});
+    y+=Math.ceil(keyItems.length/2)*24+6;c.lineWidth=4;c.strokeStyle=CV['--ink'];c.beginPath();c.moveTo(lx,y-5);c.lineTo(lx+40,y-5);c.stroke();c.fillStyle=CV['--ink'];c.fillText('Drive forward',lx+50,y);
+    c.setLineDash([7,5]);c.beginPath();c.moveTo(lx+270,y-5);c.lineTo(lx+310,y-5);c.stroke();c.setLineDash([]);c.fillText('Drive in reverse',lx+320,y);y+=24;
+    c.fillStyle=CV['--muted'];c.font='13px Public Sans, sans-serif';c.fillText('Numbers follow each robot\'s run order. Times marked "moving" run while driving. Robots shown at start pose.',lx,y);y+=20;
+    c.fillText(`Auton points at ${state.autonLen} s: ${end.ourPts} (+${end.midPts} midfield).`,lx,y);
+    T=save;drawAll();
+    cv.toBlob(blob=>{const url=URL.createObjectURL(blob);showModal(`<div class="flexrow" style="justify-content:space-between"><strong>Route image</strong><span class="flexrow"><button class="btn primary" id="dlImg">Download PNG</button><button class="btn" id="copyImg">Copy image</button><button class="btn" id="closeM">Close</button></span></div>
+      <p class="hint">1700 × 1150 px. You can also right-click the image and choose Save image.</p><img alt="Exported route map with action key" src="${url}"><span class="hint" id="imgMsg"></span>`);
+      mq('#dlImg').onclick=()=>downloadBlob(blob,`override-auton-${state.alliance}-${new Date().toISOString().slice(0,10)}.png`);
+      mq('#copyImg').onclick=()=>{try{navigator.clipboard.write([new ClipboardItem({'image/png':blob})]).then(()=>mq('#imgMsg').textContent='Image copied.',()=>mq('#imgMsg').textContent='Copy is blocked here. Use Save image instead.')}catch(_){mq('#imgMsg').textContent='Copy is blocked here. Use Save image instead.'}}},'image/png');
+  }
+  /* ---------------- Field interaction ---------------- */
+  let drag=null;
+  const snapV=v=>state.snap?Math.round(v/state.snap)*state.snap:v;
+  function evPt(e){const r=fieldCv.getBoundingClientRect();return{X:e.clientX-r.left,Y:e.clientY-r.top}}
+  function hitTest(X,Y){
+    const R=active(),near=(x,y,r=10)=>Math.hypot(px(x)-X,py(y)-Y)<=r;
+    const p=R.start,d=p.h*D2R,kx=px(p.x)+Math.sin(d)*(R.l/2*T.s+10),ky=py(p.y)-Math.cos(d)*(R.l/2*T.s+10);
+    if(Math.hypot(kx-X,ky-Y)<9)return{t:'knob'};
+    for(let i=R.segs.length-1;i>=0;i--){const s=R.segs[i];if(s.type==='bezier'){if(near(s.c2.x,s.c2.y,8))return{t:'c2',i};if(near(s.c1.x,s.c1.y,8))return{t:'c1',i}}}
+    for(let i=R.segs.length;i>=0;i--){const w=i?R.segs[i-1]:R.start;if(near(w.x,w.y,10))return{t:'wp',i}}
+    for(let ri=0;ri<state.robots.length;ri++){if(ri===state.active)continue;const O=state.robots[ri];if(O.hidden||(O.kind==='ghost'&&state.mode!=='match'))continue;const ws=[O.start,...O.segs];for(let i=ws.length-1;i>=0;i--)if(near(ws[i].x,ws[i].y,8))return{t:'other',ri,i}}
+    return null;
+  }
+  fieldCv.addEventListener('pointerdown',e=>{const {X,Y}=evPt(e),R=active(),h=hitTest(X,Y);
+    if(h&&h.t==='other'){state.active=h.ri;state.sel=h.i;renderRobotSeg();recompute();renderPanel();return}
+    if(h){fieldCv.setPointerCapture(e.pointerId);drag={...h,moved:false};if(h.t==='wp'){state.sel=h.i;renderPanel()}drawAll();return}
+    if(state.tool==='line'||state.tool==='bezier'){const x=clamp(snapV(wx(X)),-HALF,HALF),y=clamp(snapV(wy(Y)),-HALF,HALF);if(x!==clamp(wx(X),-HALF-4,HALF+4)&&Math.abs(wx(X))>HALF+4)return;
+      const p0=R.segs.length?R.segs.at(-1):R.start;
+      if(state.tool==='line')R.segs.push(L(x,y));
+      else{const res=resOf(R);const lastH=res.S.at(-1).h;const prevRev=R.segs.length?R.segs.at(-1).rev:false;const dir=lastH*D2R,len=Math.max(4,Math.hypot(x-p0.x,y-p0.y)/3);
+        R.segs.push(B(x,y,[p0.x+Math.sin(dir)*len,p0.y+Math.cos(dir)*len],[x+(p0.x-x)/3,y+(p0.y-y)/3],{rev:prevRev}))}
+      state.sel=R.segs.length;recompute();renderPanel();return}
+    state.sel=state.sel;drawAll();
+  });
+  let raf=0;
+  fieldCv.addEventListener('pointermove',e=>{const {X,Y}=evPt(e),x=wx(X),y=wy(Y);
+    $('#hud').textContent=Math.abs(x)<=HALF&&Math.abs(y)<=HALF?`${fmtPos(x,y)} · ${Math.abs(x)+Math.abs(y)<MID_IN?'Midfield':QUAD_ALLY[quadOf(x,y)]+' '+({L:'left',R:'right',T:'top',B:'bottom'})[quadOf(x,y)]+' Quadrant'}`:'—';
+    if(!drag){const h=hitTest(X,Y);fieldCv.style.cursor=h?(h.t==='knob'?'grab':'move'):(state.tool==='select'?'default':'crosshair');return}
+    drag.moved=true;const R=active(),sx=clamp(snapV(x),-HALF,HALF),sy=clamp(snapV(y),-HALF,HALF);
+    if(drag.t==='wp')moveWp(R,drag.i,sx,sy);
+    else if(drag.t==='c1'||drag.t==='c2'){R.segs[drag.i][drag.t]={x:clamp(x,-HALF-24,HALF+24),y:clamp(y,-HALF-24,HALF+24)};if(drag.t==='c2'&&R.segs[drag.i].lock!=null){}}
+    else if(drag.t==='knob'){let hh=hdg(x-R.start.x,y-R.start.y);if(!e.shiftKey)hh=Math.round(hh/15)*15;R.start.h=norm(hh)}
+    if(!raf)raf=requestAnimationFrame(()=>{raf=0;recompute()});
+  });
+  const endDrag=()=>{if(drag){const m=drag.moved;drag=null;if(m){recompute();renderPanel()}}};
+  fieldCv.addEventListener('pointerup',endDrag);fieldCv.addEventListener('pointercancel',endDrag);
+  fieldCv.addEventListener('pointerleave',()=>{$('#hud').textContent='—'});
+
+  /* Timeline scrub */
+  let scrub=false;
+  const scrubTo=e=>{const r=tlCv.getBoundingClientRect(),X=e.clientX-r.left,Tm=tlCv._Tm||30;state.time=clamp((X-TL.lab)/(r.width-TL.lab-8)*Tm,0,Tm);drawAll()};
+  tlCv.addEventListener('pointerdown',e=>{scrub=true;tlCv.setPointerCapture(e.pointerId);state.playing=false;scrubTo(e)});
+  tlCv.addEventListener('pointermove',e=>{if(scrub)scrubTo(e)});
+  tlCv.addEventListener('pointerup',()=>{scrub=false;if(state.tab==='score')renderPanel()});
+
+  /* ---------------- Toolbar ---------------- */
+  function renderRobotSeg(){$('#robotSeg').innerHTML=state.robots.map((R,i)=>`<button data-r="${i}" aria-pressed="${i===state.active}"><span class="dot" style="background:${rcol(R)}"></span> ${R.kind==='ghost'?esc(R.name):'R'+(R.slot+1)}</button>`).join('');
+    $('#addGhost').disabled=state.robots.filter(r=>r.kind==='ghost').length>=2||state.mode!=='match'}
+  function syncToolbar(){readVars();root.querySelectorAll('#modeSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.mode===state.mode));
+    root.querySelectorAll('#allySeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.ally===state.alliance));
+    root.querySelectorAll('#toolSeg button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.tool===state.tool));
+    $('#autonLen').value=state.autonLen;$('#snapSel').value=state.snap;$('#unitSel').value=state.units;fieldCv.classList.toggle('sel',state.tool==='select');renderRobotSeg()}
+  $('#modeSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;state.mode=b.dataset.mode;state.autonLen=state.mode==='match'?30:60;if(state.mode==='skills'&&active().kind==='ghost')state.active=0;syncToolbar();recompute();renderPanel()};
+  $('#autonLen').onchange=e=>{state.autonLen=clamp(+e.target.value||30,5,120);recompute();renderPanel()};
+  $('#allySeg').onclick=e=>{const b=e.target.closest('button');if(!b||b.dataset.ally===state.alliance)return;swapAlliance();};
+  $('#robotSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;state.active=+b.dataset.r;state.sel=0;syncToolbar();recompute();renderPanel()};
+  $('#toolSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;state.tool=b.dataset.tool;syncToolbar()};
+  $('#snapSel').onchange=e=>{state.snap=+e.target.value};
+  $('#unitSel').onchange=e=>{state.units=e.target.value;renderPanel()};
+  $('#addGhost').onclick=()=>{const n=state.robots.filter(r=>r.kind==='ghost').length;const sx=state.alliance==='red'?1:-1;
+    state.robots.push({id:'g'+Date.now(),name:`Opp ${n+1}`,kind:'ghost',slot:n,w:18,l:18,hidden:false,params:defParams(false),start:{x:sx*(36-n*20),y:n?-60:60,h:sx>0?270:90},segs:[],actions:[]});
+    state.active=state.robots.length-1;state.sel=0;state.tool='bezier';syncToolbar();recompute();renderPanel()};
+  $('#tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;state.tab=b.dataset.tab;renderPanel()};
+  $('#playBtn').onclick=()=>togglePlay();
+  $('#restartBtn').onclick=()=>{state.time=0;drawAll()};
+  $('#rateSel').onchange=e=>{state.rate=+e.target.value};
+  function togglePlay(){state.playing=!state.playing;if(state.playing){if(state.time>=maxT()-0.01)state.time=0;last=performance.now();requestAnimationFrame(tick)}else renderPanel();updateTransport()}
+  let last=0;function tick(now){if(!state.playing)return;const dt=Math.min(0.1,(now-last)/1000);last=now;state.time+=dt*state.rate;if(state.time>=maxT()){state.time=maxT();state.playing=false;renderPanel()}drawAll();if(state.playing)requestAnimationFrame(tick)}
+
+  /* Mirror & swap */
+  const xfPt=(p,f)=>{const q=f(p.x,p.y);p.x=q.x;p.y=q.y};
+  function transformAll(fp,fh,goalMap){state.robots.forEach(R=>{xfPt(R.start,fp);R.start.h=norm(fh(R.start.h));R.segs.forEach(s=>{xfPt(s,fp);if(s.c1){xfPt(s.c1,fp);xfPt(s.c2,fp)}if(s.lock!=null)s.lock=norm(fh(s.lock))});
+    R.actions.forEach(a=>{const gl=GOALS.find(q=>q.id===a.goal);if(gl){const t=fp(gl.x,gl.y);const m=GOALS.find(q=>Math.hypot(q.x-t.x,q.y-t.y)<1);if(m)a.goal=m.id}
+      const tg=TOGGLES.find(q=>q.id===a.toggle);if(tg){const t=fp(tg.x,tg.y);const m=TOGGLES.find(q=>Math.hypot(q.x-t.x,q.y-t.y)<1);if(m)a.toggle=m.id}
+      if(goalMap)goalMap(a)})})}
+  function swapAlliance(){transformAll((x,y)=>({x:-x,y:-y}),h=>h+180,a=>{if(a.pin==='ry')a.pin='by';else if(a.pin==='by')a.pin='ry'});state.alliance=oppA();syncToolbar();recompute();renderPanel()}
+  $('#swapAlly').onclick=swapAlliance;
+  $('#mirrorY').onclick=()=>{transformAll((x,y)=>({x:y,y:x}),h=>90-h);recompute();renderPanel()};
+
+  /* Keyboard */
+  document.addEventListener('keydown',e=>{if(!hooks.isActive()||/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)||isModalOpen())return;const k=e.key.toLowerCase();
+    if(k===' '){e.preventDefault();togglePlay()}
+    else if(k==='v'||k==='l'||k==='b'){state.tool={v:'select',l:'line',b:'bezier'}[k];syncToolbar()}
+    else if((k==='delete'||k==='backspace')&&state.sel>0){e.preventDefault();const R=active(),sel=state.sel;confirmDelete(`Delete waypoint ${sel}?`,`Its segment and ${R.actions.filter(a=>a.wp===sel).length} action(s) at this waypoint will be removed.`,()=>{delWp(R,sel);recompute();renderPanel();renderRobotSeg()})}
+    else if(k==='arrowright'||k==='arrowleft'){state.time=clamp(state.time+(k==='arrowright'?0.1:-0.1)*(e.shiftKey?10:1),0,maxT());drawAll()}
+    else if(/^[1-4]$/.test(k)&&state.robots[+k-1]){state.active=+k-1;state.sel=0;syncToolbar();recompute();renderPanel()}
+    });
+
+  /* Field image overlay */
+  function ovSync(){$('#ovCtl').hidden=!ov.img;$('#ovHint').hidden=!!ov.img;$('#ovOp').value=ov.op;root.querySelectorAll('[data-edge]').forEach(el=>el.value=ov.trims[+el.dataset.edge]);$('#ovOn').checked=ov.on}
+  function ovSave(){try{if(ov.src)localStorage.setItem(OVKEY,JSON.stringify({src:ov.src,op:ov.op,trims:ov.trims,rot:ov.rot,flip:ov.flip,on:ov.on}));else localStorage.removeItem(OVKEY)}catch(_){}}
+  function ovLoad(src,opts){const im=new Image();im.onload=()=>{ov.img=im;ov.src=src;Object.assign(ov,opts||{});ovSync();drawAll();ovSave()};im.onerror=()=>{$('#ovHint').textContent='That file could not be read as an image. Try a PNG or JPG.'};im.src=src}
+  function ovFromFile(f){if(!f||!/^image\//.test(f.type))return;const r=new FileReader();r.onload=()=>ovLoad(r.result,{trims:[0,0,0,0],rot:0,flip:false,on:true});r.readAsDataURL(f)}
+  $('#ovFile').onchange=e=>{ovFromFile(e.target.files&&e.target.files[0]);e.target.value=''};
+  document.addEventListener('paste',e=>{if(!hooks.isActive()||/INPUT|TEXTAREA/.test(e.target.tagName))return;const it=[...(e.clipboardData?.items||[])].find(i=>i.type.startsWith('image/'));if(it){e.preventDefault();ovFromFile(it.getAsFile())}});
+  const fw=root.querySelector('.fieldwrap');fw.addEventListener('dragover',e=>{if([...(e.dataTransfer?.items||[])].some(i=>i.kind==='file'))e.preventDefault()});fw.addEventListener('drop',e=>{const f=e.dataTransfer?.files?.[0];if(f&&f.type.startsWith('image/')){e.preventDefault();ovFromFile(f)}});
+  $('#ovOp').oninput=e=>{ov.op=+e.target.value;drawAll()};$('#ovOp').onchange=ovSave;
+  root.querySelectorAll('[data-edge]').forEach(el=>{el.oninput=()=>{const t=ov.trims.slice();t[+el.dataset.edge]=+el.value;const o=(+el.dataset.edge+2)%4;if(t[+el.dataset.edge]+t[o]>90){t[+el.dataset.edge]=90-t[o];el.value=t[+el.dataset.edge]}ov.trims=t;drawAll()};el.onchange=ovSave});
+  $('#ovRot').onclick=()=>{ov.rot=(ov.rot+1)%4;drawAll();ovSave()};
+  $('#ovFlip').onclick=()=>{ov.flip=!ov.flip;drawAll();ovSave()};
+  $('#ovOn').onchange=e=>{ov.on=e.target.checked;drawAll();ovSave()};
+  $('#ovDel').onclick=()=>confirmDelete('Remove the field image?','You will need to load or paste it again to get it back.',()=>{ov.img=null;ov.src=null;ovSync();drawAll();ovSave()});
+  try{const sv=JSON.parse(localStorage.getItem(OVKEY)||'null');if(sv&&sv.src)ovLoad(sv.src,{op:sv.op,trims:Array.isArray(sv.trims)?sv.trims:[sv.trim||0,sv.trim||0,sv.trim||0,sv.trim||0],rot:sv.rot,flip:sv.flip,on:sv.on})}catch(_){}
+  ovSync();
+
+  /* ---------------- Hover help ---------------- */
+  const TIPS={
+    'robot.name':'Name shown on the field, timeline, warnings and exported images.',
+    'robot.size':'Starting footprint. VEX U requires one robot that fits 24 × 24 in and one that fits 15 × 15 in at the start of the Match.',
+    'robot.w':'Side-to-side width, used for collision and rule checks.',
+    'robot.l':'Front-to-back length, used for collision and rule checks.',
+    'robot.show':'Show or hide this opponent ghost on the field and in collision checks.',
+    'p.wheel':'Drive wheel diameter. Bigger wheels cover more ground per turn but accelerate more slowly.',
+    'p.cart':'V5 motor cartridge, which sets motor free speed: 100, 200 or 600 rpm.',
+    'p.gIn':'Teeth on the gear attached to the motor. Wheel rpm = cartridge rpm × motor teeth ÷ wheel teeth.',
+    'p.gOut':'Teeth on the gear attached to the wheel. Same number as the motor gear means direct drive.',
+    'p.motors':'Total drive motors, split evenly between the left and right sides. More motors add acceleration, not top speed.',
+    'p.mass':'Robot weight. Heavier robots accelerate more slowly.',
+    'p.eff':'Share of theoretical free speed the robot really reaches after friction, load and battery sag. 70–85% is typical.',
+    'p.track':'Distance between the left and right wheel centers. Sets how fast the robot can point-turn and how much curves slow it down.',
+    'p.vMode':'<b>Derived</b> calculates top speed from the drivetrain numbers above. <b>Manual</b> lets you enter the speed you measured.',
+    'p.vMan':'Top speed of each drive side, in inches per second. Measure it by timing a full-speed straight run.',
+    'p.aMode':'<b>Derived</b> estimates acceleration from motor torque, mass and traction. <b>Manual</b> lets you enter your controller\'s real limit.',
+    'p.aMan':'How fast the robot reaches top speed, in inches per second squared. Top speed ÷ this number = seconds to reach full speed.',
+    'p.turnPct':'Tank wheels slide sideways in a point turn, so turns run slower than the math predicts. Lower this until turn times match your robot.',
+    'p.curv':'Also slow down on tight curves so the robot doesn\'t slide, using the lateral accel limit below. The outer side\'s speed limit always applies.',
+    'p.aLat':'How hard the robot can corner before its wheels slip. Lower values make it take curves more slowly.',
+    'start.x':'Starting X position of the robot\'s center. Negative is toward the red station.',
+    'start.y':'Starting Y position of the robot\'s center. Positive is toward the top wall.',
+    'start.h':'Starting heading. 0° faces the top wall, 90° faces the blue station, clockwise positive (the same as a VEX inertial sensor).',
+    'seg.x':'X position of this waypoint.','seg.y':'Y position of this waypoint.',
+    'seg.type':'<b>Line</b> drives straight to this point. <b>Bezier</b> drives a smooth curve you shape with the two square handles.',
+    'seg.rev':'Drive this segment backwards. The robot keeps facing the opposite way from travel; the path is drawn dashed.',
+    'seg.lockOn':'Make the robot end facing a set heading here. On a Bezier the end handle lines up with it; otherwise the robot turns in place on arrival.',
+    'seg.lock':'Heading the robot faces when it reaches this waypoint.',
+    'seg.spd':'Caps speed on this segment as a percent of top speed, for careful approaches to goals.',
+    'st.opp':'Points you expect the opponent to score in auton. Used to tell whether you win the 12-point Autonomous Bonus.',
+    'act.goal':'The goal this action scores on.',
+    'act.pin':'Which Pin to score. <b>Held pin</b> uses whatever the robot is carrying, starting with its Preload.',
+    'act.up':'Which half of the Pin points up once it is placed.',
+    'act.vis':'Which halves stay visible. A half nested in a goal or in a cup\'s solid half doesn\'t score; a half in a cup\'s clear half does.',
+    'act.toggle':'The wall Toggle this action sets to your alliance color. It decides who owns yellow halves in that Quadrant.',
+    'act.label':'Your name for this mechanism step, such as clamp, wing or lift.',
+    'act.dur':'How long the action takes, in seconds.',
+    'act.mode':'<b>Waits</b>: the robot stops until the action finishes. <b>While moving</b>: it starts as the robot leaves this waypoint.',
+    'newKind':'Type of action to add at the selected waypoint.',
+    'mode':'<b>Match auton</b>: both robots, 30 s, scored with VEX U auton rules. <b>Skills</b>: 60 s, both robots on the red side, no opponents.',
+    'autonLen':'Length of the period in seconds. VEX U auton is 30 s; skills is 60 s.',
+    'ally':'Which alliance you are planning for. Use Swap alliance to move your routes to the other side.',
+    'robot':'Which robot you are editing. Click a waypoint of another robot on the field to switch to it.',
+    'addGhost':'Add an opponent robot with its own path, to see where it could collide with yours. Ghosts don\'t score.',
+    'tool':'<b>Select</b> (V): drag waypoints and handles. <b>Line</b> (L) and <b>Bezier</b> (B): click the field to add waypoints.',
+    'snap':'Round new and dragged waypoints to this grid. A tile is 24 in.',
+    'units':'Units for positions: inches from field center, tiles from the bottom-left corner, or VEX GPS millimeters.',
+    'swapAlly':'Rotate every route 180° and switch red and blue, so a red auton becomes the matching blue auton.',
+    'theme':'Switch between light and dark mode. Your choice is remembered in this browser.',
+    'mirrorY':'Reflect every route across the field\'s other diagonal. This swaps your two Quadrants and keeps you on your side.',
+    'play':'Play or pause the routine (Space). Arrow keys step 0.1 s; hold Shift for 1 s.',
+    'restart':'Jump back to 0 s.',
+    'rate':'Playback speed.',
+    'ovFile':'Load a picture of the field to trace over. A cropped screenshot of the manual\'s top-down figure works well.',
+    'ovOp':'How strongly the field image shows through.',
+    'ovT':'Cut this much off the top of the image so its perimeter lines up with the field edge.',
+    'ovB':'Cut this much off the bottom of the image.','ovL':'Cut this much off the left side of the image.','ovR':'Cut this much off the right side of the image.',
+    'ovRot':'Rotate the image 90°. The red station belongs on the left.','ovFlip':'Mirror the image left to right.',
+    'ovOn':'Show or hide the field image without removing it.','ovDel':'Remove the field image.',
+  };
+  ['#modeSeg:mode','#autonLen:autonLen','#allySeg:ally','#robotSeg:robot','#addGhost:addGhost','#toolSeg:tool','#snapSel:snap','#unitSel:units','#swapAlly:swapAlly','#mirrorY:mirrorY','#playBtn:play','#restartBtn:restart','#rateSel:rate','label[for=ovFile]:ovFile','#ovOp:ovOp','#ovT:ovT','#ovB:ovB','#ovL:ovL','#ovR:ovR','#ovRot:ovRot','#ovFlip:ovFlip','#ovOn:ovOn','#ovDel:ovDel'].forEach(k=>{const [sel,key]=k.split(':');const el=root.querySelector(sel);if(el){el.dataset.tip=key;const lb=el.id&&root.querySelector(`label[for="${el.id}"]`);if(lb)lb.dataset.tip=key}});
+  function tagTips(root){root.querySelectorAll('[data-bind]').forEach(el=>{let key=el.dataset.bind;if(key.startsWith('act:'))key='act.'+key.split('.').pop();if(!TIPS[key])return;el.dataset.tip=key;
+      let lb=el.id?root.querySelector(`label[for="${el.id}"]`):null;if(!lb){const host=el.parentElement&&el.parentElement.tagName==='SPAN'?el.parentElement:el,prev=host.previousElementSibling;if(prev&&prev.tagName==='LABEL')lb=prev}if(lb)lb.dataset.tip=key});
+    const ty=root.querySelector('#i_type');if(ty){ty.dataset.tip='seg.type';const lb=root.querySelector('label[for="i_type"]');if(lb)lb.dataset.tip='seg.type'}
+    const nk=root.querySelector('#newKind');if(nk)nk.dataset.tip='newKind'}
+  registerTips('plan',TIPS);
+
+  /* Boot */
+  new ResizeObserver(()=>drawAll()).observe(root.querySelector('.fieldwrap'));
+  window.addEventListener('resize',()=>drawAll());
+  onThemeChange(()=>{if(hooks.isActive()){syncToolbar();drawAll();renderPanel()}});
+  syncToolbar();
+  try{const saved=localStorage.getItem(PROJKEY);if(saved)loadProject(saved)}catch(_){}
+  recompute();renderPanel();
+  if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>drawAll());
+
+  return{
+    /** Called by the shell when this view becomes visible. */
+    show(){syncToolbar();drawAll();renderPanel()},
+  };
+}
